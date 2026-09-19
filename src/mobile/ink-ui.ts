@@ -479,9 +479,38 @@ export class InkUI {
 		// pagerendered），applyActivePen 必须等模式真落盘，否则 UIManager 拿不到。
 		const pen = this.pens[this.penIndex];
 		const res = pen.kind === 'marker' ? await this.engine.enterMarker() : await this.engine.enterInk();
-		if (!res.ok) {
-			new Notice(`手写模式不可用：${res.error ?? '未知原因'}`);
+
+		// ⚠️ 这里**只有 res.error 才是真失败**（viewer 还没 setDocument，pdf.js 的门闩
+		// 未开，赋值当场抛 "The AnnotationEditor is not enabled."）。
+		//
+		// res.ok === false 只代表「没能在超时时间内观察到模式落盘」，**不代表进不去**：
+		// pdf.js 的 NONE → INK 是异步重路径 —— 先 toggleEditingMode，再等**所有已渲染页**
+		// pagerendered，最后 setTimeout(updater, 0) 才真正写值。移动端首屏较大的 PDF
+		// 完全可能超过 8s。0.4.3 及以前在这里 `if (!res.ok) { Notice(...); return; }`，
+		// 于是真机上「每次打开手写都提示不可用、要等一会才能用」，而更严重的是
+		// **整套 UI 都没挂上**：笔盒、手势盾、触摸路由、attachDrawSettle（自动落盘）、
+		// 固有笔迹播种全部缺席 —— 用户在提示出现后接着写，笔迹既不落盘也擦不掉，
+		// 于是「重开文件后手写内容又消失了」。这是本轮两个主诉的共同根因。
+		//
+		// UI 挂载与模式值无关（落墨最终由 pdf.js 自己的编辑层处理），所以照常继续，
+		// 只补一次延迟重试，避免真的卡在旧模式上。
+		if (res.error) {
+			new Notice(`手写模式不可用：${res.error}`);
 			return;
+		}
+		if (!res.ok) {
+			console.warn(
+				'[FleurPDF Ink] 进入手写模式未在超时内确认，继续挂载 UI 并延迟重试：',
+				res.before,
+				'→',
+				res.after,
+			);
+			const wantMode = this.engine.constants?.AnnotationEditorType.INK ?? 15;
+			window.setTimeout(() => {
+				if (!this.active) return;
+				if (this.engine.getMode() === wantMode) return;
+				void this.engine.setModeAsync(wantMode, 4000);
+			}, 2500);
 		}
 
 		await this.applyActivePen();

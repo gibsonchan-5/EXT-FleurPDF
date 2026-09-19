@@ -4,13 +4,18 @@
 // 内置墨迹引擎只有「画」和「整体删除注释」，没有笔画级擦除。而橡皮是刚需。
 //
 // 实现路径（关键设计决策）：全程只走公开契约，不碰任何 #private 字段。
-//   1. editor.serialize() 给出的 paths.lines 本身就是「一条笔画一项」的数组；
+//   1. readInkGeometry() 给出的 paths.lines 本身就是「一条笔画一项」的数组；
 //   2. 命中检测在裁剪后的点集上自算（pdf.js 没有 isHit，实测 editor.js / draw.js 均零命中）；
 //   3. 裁掉目标笔画后，用 InkEditor.deserialize() 重建编辑器。
 //
 // 之所以强调「不碰 private」：InkEditor 的笔画集合是真正的 ES private field
 // （`#drawOutlines`，不出现在 Object.getOwnPropertyNames 里），拿不到也改不了。
-// 而 serialize/deserialize 是稳定契约 —— 这让本模块对 Obsidian 升级（风险 R5）更鲁棒。
+// 而 serialize / deserialize 是稳定契约 —— 这让本模块对 Obsidian 升级（风险 R5）更鲁棒。
+//
+// ⚠️ 0.4.4 修正：数据源从 `editor.serialize()` 换成 `readInkGeometry(editor)`
+// （内部走 `serialize(true)`）。原因见 ink-engine.ts 里该函数的长注释 ——
+// 一句话：`serialize()` 对「文件固有且用户没改过」的编辑器**恒返回 null**，
+// 于是历史笔迹一条都读不到，表现为「橡皮擦不掉之前的笔迹」。
 //
 // 0.2.0 三种擦除模式（对齐 GoodNotes）：
 //   · stroke 笔画擦除 —— 触到哪笔删哪笔（整笔消失）。
@@ -22,7 +27,7 @@
 //
 // 三种模式共用同一套「删旧 → deserialize 重建 → layer.add」的契约重建流程。
 
-import type { InkEngine } from './ink-engine';
+import { readInkGeometry, stripInkIdentity, type InkEngine } from './ink-engine';
 
 /** PDF 用户空间坐标（原点左下，与 serialize() 的 lines 同一坐标系）。 */
 export interface PdfPoint {
@@ -270,12 +275,90 @@ function hitRadius(radius: number | undefined): number {
 	return Math.max(10, (radius ?? 12) * 1.25);
 }
 
+/* ============================ 重建数据格式 ============================ */
+//
+// ⚠️ 0.4.4 新修的一处**必然失败**（已用真实 pdf.js 实测复现，见 .qa/ink-editor-driver.mjs）：
+// 旧代码重建时只给了 `paths.lines`，没给 `paths.points`。而 pdf.js 的
+// InkDrawOutline.deserialize 里有这么一行：
+//
+//   for (let t = 0, e = n.length; t < e; t++)
+//     d.push({ line: f(n[t].map(...)), points: f(o[t].map(...)) });   // ← o[t] 无条件读取
+//
+// points 缺失时 `o[t]` 直接抛
+//   TypeError: Cannot read properties of undefined (reading '0')
+// 而调用方（eraseAtPoint / eraseInRect）是 try/catch 包着的 ——
+// 于是「旧注释已删除、新注释没建起来」，用户看到的不是「擦掉一笔」，
+// 而是**整条注释连其余笔画一起消失**。
+//
+// 实测结论（Chromium + Obsidian 内置 pdf.js，真实 InkEditor）：
+//   · 只传 lines            → ✗ TypeError: Cannot read properties of undefined (reading '0')
+//   · lines + points 对齐   → ✓ 建出 InkEditor，serialize()/serializeDraw() 均正常
+//
+// 另外 `line` 本身也必须符合格式：**每 6 个数一组的三次贝塞尔**
+//   [NaN,NaN,NaN,NaN, x0,y0, c1x,c1y,c2x,c2y, x1,y1, ...]
+// 因为 pdf.js 的 toSVGPath / _computeBbox 都按 `i += 6` 解析。像素擦除切出来的
+// 子折线是「扁平 [x,y,x,y,…]」，直接塞进 lines 会被按 6 个一组当成乱码读 ——
+// 所以必须经 polylineToLine() 转码。
+
+/**
+ * 把扁平点列 [x,y,x,y,…] 编码成 pdf.js 的 line 格式（6 个数一组的三次贝塞尔）。
+ *
+ * 直线段的编码技巧：控制点取端点本身（C1=P0、C2=P1）。此时
+ *   B(t) = P0·[(1−t)³+3(1−t)²t] + P1·[3(1−t)t²+t³]
+ * 两个系数在 t∈[0,1] 上恒非负且和为 1，曲线始终落在 P0P1 线段上 ——
+ * 几何上就是一条直线，只是参数化非线性。对折线数据这是精确表示。
+ */
+export function polylineToLine(pts: ArrayLike<number>): Float32Array {
+	const flat = finitePoints(pts);
+	if (flat.length === 0) return new Float32Array(0);
+	const out: number[] = [NaN, NaN, NaN, NaN, flat[0][0], flat[0][1]];
+	for (let i = 1; i < flat.length; i++) {
+		const [px, py] = flat[i - 1];
+		const [x, y] = flat[i];
+		out.push(px, py, x, y, x, y);
+	}
+	return Float32Array.from(out);
+}
+
+/**
+ * 从 line 里抽出「落在曲线上的锚点」，作为重建数据的 points 项。
+ *
+ * line 每 6 个数一组的第 5、6 个位置就是该段的终点（首组即起点），
+ * 所以按 i = 4, 10, 16… 取即可。
+ */
+export function anchorsOfLine(line: ArrayLike<number>): Float32Array {
+	const out: number[] = [];
+	for (let i = 4; i + 1 < line.length; i += 6) {
+		const x = line[i];
+		const y = line[i + 1];
+		if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+		out.push(x, y);
+	}
+	if (out.length) return Float32Array.from(out);
+	// 兜底：line 长度不足或全为 NaN padding 时，退化成扁平解读
+	return Float32Array.from(finitePoints(line).flat());
+}
+
 /** 单个编辑器的「擦后数据」：剩余笔画列表 + 是否有改动。 */
 interface EditorCut {
 	editor: any;
-	serial: any;
-	remainingLines: Float32Array[];
+	/** 完整序列化数据（含 color / thickness / opacity / pageIndex / rotation），重建时复用。 */
+	data: any;
+	/** 剩余笔画，已是 pdf.js 认的 line 格式（6 个数一组）。 */
+	remainingLines: ArrayLike<number>[];
+	/** 与 remainingLines **逐项对齐**的锚点，作为重建数据的 paths.points（缺失必抛，见上方说明）。 */
+	remainingPoints: ArrayLike<number>[];
 	removed: number;
+}
+
+/**
+ * 为一个保留下来的原始笔画取它的 points 项（优先复用原数据，缺失时从 line 反推）。
+ * 索引对齐是硬要求：`o[t]` 与 `n[t]` 必须描述同一条笔画。
+ */
+function pointsForLine(lines: ArrayLike<number>[], pts: ArrayLike<number>[], index: number): ArrayLike<number> {
+	const orig = pts[index];
+	if (orig && orig.length) return orig;
+	return anchorsOfLine(lines[index]);
 }
 
 /**
@@ -306,19 +389,20 @@ export async function eraseAtPoint(
 	/* ---------- 计算每个编辑器的擦后数据 ---------- */
 	const cuts: EditorCut[] = [];
 	for (const editor of editors) {
-		let serial: any;
-		try {
-			serial = editor.serialize();
-		} catch {
-			continue;
-		}
-		const lines: ArrayLike<number>[] = serial?.paths?.lines ?? [];
-		if (!lines.length) continue;
+		// readInkGeometry 内部走 serialize(true)：对新笔与「文件固有笔迹」都能拿到 lines。
+		// 旧代码直接 editor.serialize()，固有笔迹恒为 null → 这里被 continue 静默跳过，
+		// 就是真机上「擦不掉之前的笔迹」的全部原因。
+		const geom = readInkGeometry(editor);
+		if (!geom) continue;
+		const lines = geom.lines;
+		const pts = geom.points;
 
-		const remainingLines: Float32Array[] = [];
+		const remainingLines: ArrayLike<number>[] = [];
+		const remainingPoints: ArrayLike<number>[] = [];
 		let removed = 0;
 
-		for (const line of lines) {
+		for (let li = 0; li < lines.length; li++) {
+			const line = lines[li];
 			if (mode === 'pixel') {
 				const pieces = cutPolylineByDisk(line, point.x, point.y, eraserRadius);
 				if (pieces.length === 0) {
@@ -329,22 +413,31 @@ export async function eraseAtPoint(
 				const finiteLen = finitePoints(line).length * 2;
 				const total = pieces.reduce((s, p) => s + p.length, 0);
 				if (pieces.length === 1 && total >= finiteLen) {
-					remainingLines.push(pieces[0]); // 未切到，原样保留，避免无效重建
+					// 未切到，原样保留，避免无效重建
+					remainingLines.push(line);
+					remainingPoints.push(pointsForLine(lines, pts, li));
 				} else {
 					removed++;
-					remainingLines.push(...pieces);
+					// 切开的子折线是扁平点列，必须转成 line 格式（见 polylineToLine 注释）
+					for (const piece of pieces) {
+						remainingLines.push(polylineToLine(piece));
+						remainingPoints.push(piece);
+					}
 				}
 			} else {
 				const d = distToPolyline(line, point.x, point.y);
 				if (Number.isFinite(d) && d <= eraserRadius) {
 					removed++; // 笔画擦除：触到即整笔消失
 				} else {
-					remainingLines.push(new Float32Array(line as any));
+					remainingLines.push(line);
+					remainingPoints.push(pointsForLine(lines, pts, li));
 				}
 			}
 		}
 
-		if (removed > 0) cuts.push({ editor, serial, remainingLines, removed });
+		if (removed > 0) {
+			cuts.push({ editor, data: geom.data, remainingLines, remainingPoints, removed });
+		}
 	}
 
 	if (!cuts.length) return none;
@@ -370,15 +463,15 @@ export async function eraseAtPoint(
 			continue;
 		}
 
-		const rebuiltData: any = {
-			...cut.serial,
-			paths: { lines: cut.remainingLines },
-		};
-		// 丢掉身份，让它以「新建编辑器」的身份重新入库。
-		// 注意：points 数组同步省略 —— 0.1.0 的笔画擦除已验证 deserialize 不依赖它，
-		// 且像素切割后的子折线与原 points 无法逐点对应。
-		delete rebuiltData.id;
-		delete rebuiltData.annotationElementId;
+		const rebuiltData: any = stripInkIdentity({
+			...cut.data,
+			paths: { lines: cut.remainingLines, points: cut.remainingPoints },
+		});
+		// 丢掉身份（id / annotationElementId），让它以「新建编辑器」的身份重新入库；
+		// 同时丢掉 isCopy —— serialize(true) 会带上它，留着会让 render() 走
+		// _moveAfterPaste 把重建的笔迹再挪一次。
+		// ⚠️ points 必须给，且与 lines 逐项对齐 —— 缺了它 deserialize 必抛
+		// 「Cannot read properties of undefined (reading '0')」，见文件上方的格式说明。
 
 		const Editor = cut.editor.constructor;
 		try {
@@ -433,18 +526,18 @@ export async function eraseInRect(
 
 	const cuts: EditorCut[] = [];
 	for (const editor of editors) {
-		let serial: any;
-		try {
-			serial = editor.serialize();
-		} catch {
-			continue;
-		}
-		const lines: ArrayLike<number>[] = serial?.paths?.lines ?? [];
-		if (!lines.length) continue;
+		// 同 eraseAtPoint：必须走 readInkGeometry（serialize(true)），
+		// 否则文件固有笔迹读不到 lines，选区擦除对历史笔迹完全无效。
+		const geom = readInkGeometry(editor);
+		if (!geom) continue;
+		const lines = geom.lines;
+		const pts = geom.points;
 
-		const remainingLines: Float32Array[] = [];
+		const remainingLines: ArrayLike<number>[] = [];
+		const remainingPoints: ArrayLike<number>[] = [];
 		let removed = 0;
-		for (const line of lines) {
+		for (let li = 0; li < lines.length; li++) {
+			const line = lines[li];
 			let hit = false;
 			for (let i = 0; i + 3 < line.length && !hit; i += 2) {
 				const x1 = line[i];
@@ -454,10 +547,16 @@ export async function eraseInRect(
 				if (!Number.isFinite(x1) || !Number.isFinite(y1) || !Number.isFinite(x2) || !Number.isFinite(y2)) continue;
 				if (segmentIntersectsRect(x1, y1, x2, y2, rect)) hit = true;
 			}
-			if (hit) removed++;
-			else remainingLines.push(new Float32Array(line as any));
+			if (hit) {
+				removed++;
+			} else {
+				remainingLines.push(line);
+				remainingPoints.push(pointsForLine(lines, pts, li));
+			}
 		}
-		if (removed > 0) cuts.push({ editor, serial, remainingLines, removed });
+		if (removed > 0) {
+			cuts.push({ editor, data: geom.data, remainingLines, remainingPoints, removed });
+		}
 	}
 
 	if (!cuts.length) return none;
@@ -480,9 +579,10 @@ export async function eraseInRect(
 			removedEditors++;
 			continue;
 		}
-		const rebuiltData: any = { ...cut.serial, paths: { lines: cut.remainingLines } };
-		delete rebuiltData.id;
-		delete rebuiltData.annotationElementId;
+		const rebuiltData: any = stripInkIdentity({
+			...cut.data,
+			paths: { lines: cut.remainingLines, points: cut.remainingPoints },
+		});
 		const Editor = cut.editor.constructor;
 		try {
 			const rebuilt = await Editor.deserialize(rebuiltData, layer, um);

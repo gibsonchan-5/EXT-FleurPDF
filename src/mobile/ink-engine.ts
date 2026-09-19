@@ -169,6 +169,106 @@ const FALLBACK_PARAMS_TYPE = {
 };
 
 /* ---------------------------------------------------------------------------
+ * 笔迹几何读取（橡皮 / 套索共用的唯一数据源）
+ * ------------------------------------------------------------------------- */
+
+/**
+ * 读出编辑器的笔画几何（lines / points / rect）。
+ *
+ * ⚠️ **这是「历史笔迹擦不掉、套索圈不中」的根治点，改动前务必读完本注释。**
+ *
+ * 旧写法是 `editor.serialize()`，然后取 `serial?.paths?.lines ?? []`。
+ * 在「本次会话新画的笔」上没问题，但在**文件固有笔迹**上是恒空的。
+ * 依据 Obsidian 内置 pdf.js 的构建产物（.qa/obs-pdfjs/pdf.min.mjs，已逐字核对）：
+ *
+ *   serialize() {
+ *     ...
+ *     const o = { annotationType, color, opacity, thickness,
+ *                 paths: { lines, points }, pageIndex, rect, rotation, ... };
+ *     if (t) { o.isCopy = true; return o; }          // ← t 为真时直接返回，绕过下面那一关
+ *     if (this.annotationElementId && !hasElementChanged(o)) return null;   // ★ 元凶
+ *     o.id = this.annotationElementId;
+ *     return o;
+ *   }
+ *   function hasElementChanged(o) {
+ *     return this._hasBeenMoved || this._hasBeenResized ||
+ *            o.color.some((v, i) => v !== initial.color[i]) ||   // 只比颜色
+ *            o.thickness !== initial.thickness ||                // 只比粗细
+ *            o.opacity !== initial.opacity ||                    // 只比不透明度
+ *            o.pageIndex !== initial.pageIndex;
+ *   }
+ *
+ * 两个要点：
+ *   ① 重开文件后，pdf.js 会把文件里的 /Ink 注释转成编辑器，这类编辑器带
+ *      `annotationElementId`；而 hasElementChanged **根本不比对笔画本身**（lines 不在
+ *      比对列表里），所以只要用户没改过颜色/粗细/位置，serialize() 就返回 null。
+ *   ② 返回 null 于是被下游的 `?? []` 吞成空数组 → `continue` 静默跳过 →
+ *      用户看到的就是「橡皮擦不掉历史笔迹」「套索圈不中」。
+ *
+ * 解法：改用 **`serialize(true)`**。它在 `serializeDraw` 之后立刻 `return`，
+ * 完全绕过 `annotationElementId` 那一关，而且 paths.lines / points 一应俱全 ——
+ * 是新笔还是固有笔都拿到数据。唯一副作用是对象上多一个 `isCopy: true`，
+ * 重建前必须删掉（见 stripCopyFlags），否则 DrawingEditor.render 会走
+ * `_moveAfterPaste` 分支把重建出来的笔迹挪位。
+ *
+ * 兜底链：serialize(true) 抛错 → serialize()（至少覆盖新笔）→ 返回 null。
+ */
+export interface InkGeometry {
+	lines: ArrayLike<number>[];
+	points: ArrayLike<number>[];
+	rect: number[] | null;
+	/** 完整的序列化对象（已含 color / thickness / opacity / pageIndex / rotation），供重建复用。 */
+	data: any;
+}
+
+export function readInkGeometry(editor: any): InkGeometry | null {
+	if (!editor) return null;
+
+	let data: any = null;
+	try {
+		// true = mustBeCommitted：pdf.js 会分配新的点数组（不返回内部引用），
+		// 且提前 return，绕过 annotationElementId 的 null 短路。
+		data = editor.serialize(true);
+	} catch {
+		data = null;
+	}
+	if (!data) {
+		try {
+			data = editor.serialize();
+		} catch {
+			data = null;
+		}
+	}
+	if (!data) return null;
+
+	const lines = data?.paths?.lines;
+	if (!Array.isArray(lines) || lines.length === 0) return null;
+
+	return {
+		lines,
+		points: Array.isArray(data?.paths?.points) ? data.paths.points : [],
+		rect: Array.isArray(data?.rect) && data.rect.length === 4 ? data.rect : null,
+		data,
+	};
+}
+
+/**
+ * 抹掉「重建数据」里的身份与副本标记。
+ *
+ * · `id` / `annotationElementId`：去掉才能让重建对象以「新建注释」入库；
+ *   留着的话 pdf.js 会把它当成「更新文件里那条注释」，而旧注释已被删除，语义打架。
+ * · `isCopy`：来自 serialize(true)。DrawingEditor.render() 里有
+ *   `if (this._isCopy) { ... this._moveAfterPaste(t, e) }`，会把重建的笔迹再平移一次。
+ */
+export function stripInkIdentity(data: any): any {
+	const out = { ...data };
+	delete out.id;
+	delete out.annotationElementId;
+	delete out.isCopy;
+	return out;
+}
+
+/* ---------------------------------------------------------------------------
  * 引擎
  * ------------------------------------------------------------------------- */
 
@@ -531,9 +631,13 @@ export class InkEngine {
 		try {
 			viewer.annotationEditorMode = { mode };
 			const after = this.getMode();
+			// ⚠️ 这里的 ok:false **不代表失败**，只代表「pdf.js 还没落盘」。
+			// setter 内部是异步 updater（见 setModeAsync 注释），赋值后立刻读回必然是旧值。
+			// 调用方必须用 setModeAsync —— 那里以「等到的结果」为成功依据。
 			return { ok: after === mode, before, after };
 		} catch (err) {
 			// 门闩未开（viewer 尚未 setDocument）时会抛 "The AnnotationEditor is not enabled."
+			// 这条才是真失败：error 非空即「连排期都没排上」。
 			return {
 				ok: false,
 				before,
@@ -553,61 +657,74 @@ export class InkEngine {
 	 *
 	 * 解决：监听 pdf.js 在 updater 末尾 dispatch 的 `annotationeditormodechanged` 事件。
 	 */
-	async setModeAsync(mode: number, timeoutMs = 1500): Promise<InkOpResult & { before: number; after: number }> {
+	async setModeAsync(mode: number, timeoutMs = 8000): Promise<InkOpResult & { before: number; after: number }> {
 		const r = this.setMode(mode);
-		if (r.ok && this.getMode() === mode) return r; // 同步路径已经搞定
+		// error 非空 = 赋值当场抛了（门闩未开），这才是真失败，不必等。
+		if (r.error) return r;
+		// 已经是目标模式 → setter 会直接 return 且**不派发事件**，只能靠读回值判定。
+		if (this.getMode() === mode) return { ...r, ok: true };
+
+		// ⚠️ 曾经的写法是 `ok: waited && r.ok`，这是本轮真机问题的元凶：
+		// r.ok 来自「赋值后立刻读回」，而 pdf.js 的 setter 是异步落盘
+		// （NONE → INK 要先 toggleEditingMode、等所有页 pagerendered，再 setTimeout(updater, 0)），
+		// 所以首次进入手写时 r.ok 恒为 false。于是即便事件明确告诉我们已经切好了，
+		// 返回值仍被判成失败 —— 调用方弹「手写模式不可用」并**提前 return**，
+		// 笔盒、手势盾、触摸路由、自动落盘、固有笔迹播种全都不会挂上。
+		// 成功与否只能以「等到的结果」为准，不能与同步读回相与。
 		const ok = await this.waitForMode(mode, timeoutMs);
-		const after = this.getMode();
-		return { ...r, ok: ok && r.ok, after };
+		return { ...r, ok, after: this.getMode() };
 	}
 
 	/**
-	 * 等到模式变成目标值（或超时返回 false）。优先用 `annotationeditormodechanged` 事件，
-	 * 没 eventBus 时退化为短间隔轮询。
+	 * 等到模式变成目标值（或超时返回 false）。
+	 *
+	 * 事件与轮询**同时**用：pdf.js 在 updater 末尾派发 `annotationeditormodechanged`，
+	 * 但那条事件只在「模式确实变了」时派发 —— 若我们注册监听比 updater 晚、
+	 * 或事件在视图重建途中丢失，只等事件就会白等到超时。轮询是最后的安全网。
+	 *
+	 * 超时给到 8s：NONE → INK 时 pdf.js 要等**所有已渲染页** pagerendered 才跑 updater，
+	 * 移动端渲染慢，取 1.5s（旧值）会让首屏较大的 PDF 必然判超时。
 	 */
-	private waitForMode(targetMode: number, timeoutMs = 1500): Promise<boolean> {
+	private waitForMode(targetMode: number, timeoutMs = 8000): Promise<boolean> {
 		if (this.getMode() === targetMode) return Promise.resolve(true);
-		const bus = this.handle?.eventBus;
-		if (!bus?.on) {
-			return new Promise((resolve) => {
-				const deadline = Date.now() + timeoutMs;
-				const tick = () => {
-					if (this.getMode() === targetMode) return resolve(true);
-					if (Date.now() > deadline) return resolve(false);
-					window.setTimeout(tick, 30);
-				};
-				tick();
-			});
-		}
 		return new Promise((resolve) => {
 			let done = false;
+			const bus = this.handle?.eventBus;
+			const onChanged = (payload: any) => {
+				if (payload?.mode === targetMode) finish(true);
+			};
+			const poll = window.setInterval(() => {
+				if (this.getMode() === targetMode) finish(true);
+			}, 100);
+			const timer = window.setTimeout(() => finish(this.getMode() === targetMode), timeoutMs);
+			const cleanup = () => {
+				window.clearInterval(poll);
+				window.clearTimeout(timer);
+				try { bus?.off?.('annotationeditormodechanged', onChanged); } catch { /* 视图已销毁 */ }
+			};
 			const finish = (ok: boolean) => {
 				if (done) return;
 				done = true;
+				cleanup();
 				resolve(ok);
 			};
-			const timer = window.setTimeout(() => {
-				try { bus.off?.('annotationeditormodechanged', onChanged); } catch { /* ignore */ }
-				finish(this.getMode() === targetMode);
-			}, timeoutMs);
-			const onChanged = (payload: any) => {
-				if (payload?.mode === targetMode) {
-					window.clearTimeout(timer);
-					try { bus.off?.('annotationeditormodechanged', onChanged); } catch { /* ignore */ }
-					finish(true);
-				}
-			};
 			try {
-				bus.on('annotationeditormodechanged', onChanged);
+				bus?.on?.('annotationeditormodechanged', onChanged);
 			} catch {
-				finish(this.getMode() === targetMode);
+				/* 没有 eventBus 也能靠轮询兜住 */
 			}
 		});
 	}
 
-	/** 进入手写模式（黑/墨迹）—— 异步版本，等模式真落盘。 */
-	enterInk(): Promise<InkOpResult> {
-		return this.setModeAsync(this.constants?.AnnotationEditorType.INK ?? 15).then((r) => ({ ok: r.ok, error: r.error }));
+	/**
+	 * 进入手写模式（黑/墨迹）—— 异步版本，等模式真落盘。
+	 *
+	 * ⚠️ 返回值必须带上 before/after：`ok:false` 有两种截然不同的含义
+	 * （赋值当场被拒 vs 只是没等到落盘），调用方要靠 error 与 after 区分。
+	 * 早先这里只回 `{ok, error}`，调用方既判断不了、日志也看不出发生了什么。
+	 */
+	enterInk(): Promise<InkOpResult & { before: number; after: number }> {
+		return this.setModeAsync(this.constants?.AnnotationEditorType.INK ?? 15);
 	}
 
 	/**
@@ -621,8 +738,8 @@ export class InkEngine {
 	 * 现在与 GoodNotes 同语义：荧光笔 = 钢笔调大笔触（INK 通道 + 半透明），
 	 * 渲染是一条真正的粗笔画，没有任何边框。
 	 */
-	enterMarker(): Promise<InkOpResult> {
-		return this.setModeAsync(this.constants?.AnnotationEditorType.INK ?? 15).then((r) => ({ ok: r.ok, error: r.error }));
+	enterMarker(): Promise<InkOpResult & { before: number; after: number }> {
+		return this.setModeAsync(this.constants?.AnnotationEditorType.INK ?? 15);
 	}
 
 	/** 退出编辑（提交当前会话）。NONE 让正在绘制的笔画被落成编辑器。 */
@@ -941,17 +1058,74 @@ export class InkEngine {
 	 * 因此批注不是插件私有产物 —— 换任何阅读器都看得见。
 	 *
 	 * 本方法只负责「生成字节」，不写盘。写盘与备份由 ink-storage.ts 承担。
+	 *
+	 * ⚠️ **落盘前必须先确认「真的有东西可写」** —— 这是 0.4.4 补的第二道闸门，
+	 * 针对的是 pdf.js 一个极隐蔽的静默失败。依据 Obsidian 内置 pdf.js 构建产物
+	 * （.qa/obs-pdfjs/pdf.min.mjs，逐字核对）：
+	 *
+	 *   get serializable() {
+	 *     if (0 === #storage.size) return EMPTY_STORAGE;
+	 *     const map = new Map(); let hasBitmap = false;
+	 *     for (const [k, v] of #storage) {
+	 *       const n = v instanceof AnnotationEditor ? v.serialize(false, opts) : v;
+	 *       if (n) { map.set(k, n); ... }          // ★ null 项在这里被静默丢弃
+	 *     }
+	 *     return map.size > 0 ? { map, hash, transfer } : EMPTY_STORAGE;   // ★ 全 null → 空存储
+	 *   }
+	 *
+	 *   saveDocument() {
+	 *     const { map, transfer } = this.annotationStorage.serializable;    // ← 拿到的可能是空 map
+	 *     return sendWithPromise('SaveDocument', {..., annotationStorage: map}, transfer)
+	 *            .finally(() => this.annotationStorage.resetModified());   // ★ 无论写没写都清 dirty
+	 *   }
+	 *
+	 * 而 worker 侧收到空 changes 时是 `return originalBytes`（直接回吐原文件字节，不报错）。
+	 *
+	 * 三条合起来的后果非常危险：
+	 *   ① 产出字节**长度非 0**，ink-storage 的 `bytes.length === 0` 校验抓不住；
+	 *   ② 写回去的是原文件的完整副本 —— 文件看起来「被保存过了」；
+	 *   ③ resetModified() 把 dirty 清掉，于是后续自动落盘直接跳过「没有未保存内容」。
+	 *   ⇒ 用户的笔迹**一次都不会真正进文件**，且插件全程不报错。
+	 *
+	 * 所以这里先自己算一遍 `serializable.map.size`：为 0 就返回 null，
+	 * 让 ink-storage 以 reason:'empty' 收场（不写盘、不清 dirty）。下次落盘会重试。
 	 */
 	async exportAnnotatedBytes(): Promise<Uint8Array | null> {
 		const doc = this.handle?.pdfDocument;
 		if (!doc?.saveDocument) return null;
 		const storage = doc.annotationStorage;
 		if (!storage || !storage.size) return null;
+		if (!this.hasSerializableContent(storage)) {
+			console.warn(
+				'[FleurPDF Ink] 存储里有条目但全部序列化为 null，pdf.js 会静默回吐原文件字节；本次跳过落盘。',
+			);
+			return null;
+		}
 		try {
-			const bytes: Uint8Array = await doc.saveDocument(storage);
+			// 注意：pdf.js 的 saveDocument() **不接受参数** —— 它内部自己读
+			// `this.annotationStorage.serializable`。传进去的 storage 会被忽略，
+			// 旧代码 `doc.saveDocument(storage)` 只是恰好无害，这里去掉以免误导。
+			const bytes: Uint8Array = await doc.saveDocument();
 			return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
 		} catch {
 			return null;
+		}
+	}
+
+	/**
+	 * AnnotationStorage 里是否存在「能真正序列化出来」的条目。
+	 *
+	 * 不能用 `storage.size > 0` 代替：size 是**原始条目数**，而 pdf.js 真正交给
+	 * worker 的是 `serializable.map`（已过滤掉 serialize() 返回 null 的项）。
+	 * 两者会分叉 —— 详见 exportAnnotatedBytes 的长注释。
+	 */
+	private hasSerializableContent(storage: any): boolean {
+		try {
+			const map = storage.serializable?.map;
+			return !!map && typeof map.size === 'number' && map.size > 0;
+		} catch {
+			// 探测本身失败时选择「按有内容处理」：宁可多写一次（幂等），也不要漏存。
+			return true;
 		}
 	}
 

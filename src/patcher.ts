@@ -161,6 +161,7 @@ export class PDFPatcher {
   private boundSelectionChange: (() => void) | null = null;
   private boundTouchEndForMenu: (() => void) | null = null;
   private boundTouchStartForMenu: (() => void) | null = null;
+  private boundTouchMoveForMenu: (() => void) | null = null;
   private selectionMenuTimer: number | null = null;
   /**
    * 手指是否还按在屏幕上。
@@ -172,8 +173,33 @@ export class PDFPatcher {
    *
    * 用户要的语义是明确的：「选完了再弹」。所以只要手指还在屏上就一律不弹，
    * 抬手后再走一次正常的稳定判定。
+   *
+   * ⚠️ 0.4.4 补充：这条只是必要条件，**不是充分条件**。Android WebView 拖原生
+   * 选择手柄时，手柄拖动本身由浏览器接管，**页面收不到 touchstart / touchend** ——
+   * 于是 touchSelecting 全程为 false，光靠它挡不住「拖手柄途中弹菜单」。
+   * 因此另加两道：① 选区静置时间从 500ms 提到 900ms（见 SELECTION_SETTLE_MS）；
+   * ② 选区一变就先把已弹出的面板**收掉**（见 onSelectionChange）。
    */
   private touchSelecting = false;
+  /**
+   * 选区静置多久才算「选完了」。
+   *
+   * 900ms 是权衡结果：太小则手柄吸附时的短暂停顿会误判成选完（菜单在拖动中途冒出），
+   * 太大则用户选完要干等。手柄吸附停顿通常在 300～600ms，900ms 能干净地跨过去。
+   */
+  private static readonly SELECTION_SETTLE_MS = 900;
+  /** 最近一次 selectionchange 的时刻。 */
+  private lastSelectionChangeAt = 0;
+  /** 最近一次触摸事件（start/move/end）的时刻，用于「手势静默期」判定。 */
+  private lastTouchAt = 0;
+  /**
+   * 当前面板若是「选区自动唤起」的，记下它对应的选区指纹；否则为空串。
+   *
+   * 用于区分「自动弹出的批注菜单」与「点击已有标注后打开的编辑面板」——
+   * 前者在选区变化时要立刻收掉（别挡手柄），后者不能因为一次 selectionchange 就被关掉。
+   * 由 hideContextMenu 统一清空。
+   */
+  private openAutoKey = '';
   /** 最近一次自动弹出的选区指纹 —— 同一选区不重复弹。 */
   private lastAutoMenuKey = '';
   /** 当前打开的浮动面板（同一时刻只允许一个，选区连续变化时会重建）。 */
@@ -236,9 +262,16 @@ export class PDFPatcher {
       this.boundSelectionChange = () => this.onSelectionChange();
       // 手指按下期间禁止弹菜单（见 touchSelecting 的说明），抬手后再判定
       this.boundTouchStartForMenu = () => {
+        this.lastTouchAt = Date.now();
         this.touchSelecting = true;
       };
+      // 记录触摸时刻即可，不改变选中态：用于「手势静默期」判定 —— 有些 WebView
+      // 会在 touchend 之后才把最终选区提交到 DOM，抬手瞬间就读选区会拿到拖动中途的旧值
+      this.boundTouchMoveForMenu = () => {
+        this.lastTouchAt = Date.now();
+      };
       this.boundTouchEndForMenu = () => {
+        this.lastTouchAt = Date.now();
         // 延迟一拍再放开：WebView 往往在 touchend 之后才把最终选区提交到 DOM，
         // 立刻判定会读到拖动中途的旧选区（菜单落点偏高、偏歪，且随后还会再弹一次）。
         window.setTimeout(() => {
@@ -248,6 +281,7 @@ export class PDFPatcher {
       };
       document.addEventListener('selectionchange', this.boundSelectionChange);
       document.addEventListener('touchstart', this.boundTouchStartForMenu, true);
+      document.addEventListener('touchmove', this.boundTouchMoveForMenu, true);
       document.addEventListener('touchend', this.boundTouchEndForMenu, true);
     }
 
@@ -883,20 +917,43 @@ export class PDFPatcher {
    *
    * 桌面端靠 `contextmenu`（右键）唤出面板；移动端长按选字会被 WebView 的原生
    * 文本选择接管，`contextmenu` 不会派发 —— 真机表现就是「选中了文字，但批注菜单
-   * 永远不出现」（0.3.0 小米平板反馈）。这里换成「选区稳定 320ms 后自动弹」，
+   * 永远不出现」（0.3.0 小米平板反馈）。这里换成「选区稳定后自动弹」，
    * 与手势类型无关。
    *
-   * 去抖是必须的：拖动选择手柄期间 `selectionchange` 会连续触发，
-   * 一有选区就弹面板会挡住手柄，用户没法继续调整选区。
+   * ⚠️ 0.4.4 重写。上一版的判定是「touchSelecting 为假 + 去抖 500ms」，真机仍有
+   * 「还没选完就弹菜单」：**Android WebView 拖原生选择手柄时页面收不到 touch 事件**，
+   * touchSelecting 全程是 false，只剩 500ms 去抖在挡 —— 而手柄吸附、双指微调
+   * 造成的停顿经常不到 500ms。修法是两个方向同时收紧：
+   *
+   *   ① **选区一变就把已弹出的自动面板收掉**（本方法上半段）。这一点比「不弹」
+   *      更关键：面板正好浮在选区附近，留着就直接压住选择手柄，用户根本没法继续拖，
+   *      而且随后每次选区变化还会重建一次 —— 观感就是「菜单在拖动中反复闪」。
+   *   ② 去抖从 500ms 提到 900ms（SELECTION_SETTLE_MS），跨过手柄吸附的停顿区间。
+   *
+   * 「点击已有标注打开的面板」不会被这里误收 —— 只有 openAutoKey 非空
+   * （即面板确实由选区自动唤起）时才执行收起。
    */
   private onSelectionChange(): void {
+    this.lastSelectionChangeAt = Date.now();
+    const key = this.selectionKeyNow();
+    if (this.openAutoKey && key !== this.openAutoKey) {
+      // 选区还在变 → 用户没选完。此刻收起面板，把选择手柄让出来。
+      this.hideContextMenu();
+    }
+
     if (this.selectionMenuTimer !== null) window.clearTimeout(this.selectionMenuTimer);
-    // 500ms（原 300ms）：手柄吸附、双指微调选区都会带来短暂停顿，
-    // 300ms 不足以把它们与「用户选完了」区分开。与 touchSelecting 形成双重保险。
     this.selectionMenuTimer = window.setTimeout(() => {
       this.selectionMenuTimer = null;
       this.syncMobileMenuWithSelection();
-    }, 500);
+    }, PDFPatcher.SELECTION_SETTLE_MS);
+  }
+
+  /** 当前选区指纹（长度 + 前 48 字）；没有有效选区时返回空串。 */
+  private selectionKeyNow(): string {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return '';
+    const text = sel.toString().trim();
+    return text ? `${text.length}|${text.slice(0, 48)}` : '';
   }
 
   /**
@@ -910,6 +967,11 @@ export class PDFPatcher {
   private syncMobileMenuWithSelection(): void {
     // 手指还按在屏上 → 选区尚未定稿，一律不弹（用户拖手柄时菜单绝不出现）
     if (this.touchSelecting) return;
+
+    // 手势刚结束不足 300ms：WebView 常在这之后才把最终选区提交到 DOM，
+    // 此时读到的很可能还是拖动中途的选区 —— 弹出来的菜单会落在偏歪的位置，
+    // 而且随后选区落定还会再弹一次。多等一小段再读，一次就对。
+    if (Date.now() - this.lastTouchAt < 300) return;
 
     // 手写模式下 textLayer 已禁选：既不再弹，也要把可能在切换前留下的面板收掉
     if (document.body.classList.contains('fleur-pdf-ink-active')) {
@@ -956,6 +1018,11 @@ export class PDFPatcher {
       rect.bottom + 10,
       snapshot,
       [],
+      // 声明这是「选区自动唤起」的面板：onSelectionChange 据此判断能否在选区变化时收起它。
+      // ⚠️ 必须作为参数传进去，不能在这里直接给 this.openAutoKey 赋值 —— showContextMenu
+      // 内部有一句同步的 hideContextMenu()（单实例清理），会把刚赋的值清成空串，
+      // 于是「选区一变就收面板」的判定永远不成立。
+      key,
     );
   }
 
@@ -984,6 +1051,7 @@ export class PDFPatcher {
     }
     this.openPanel?.remove();
     this.openPanel = null;
+    this.openAutoKey = '';
   }
 
   /** 外部强制收起浮动面板（进入手写模式时调用：移动端选不出文本，面板只会挡路）。 */
@@ -994,7 +1062,14 @@ export class PDFPatcher {
     this.hideContextMenu();
   }
 
-  private async showContextMenu(_x: number, _y: number, snapshot: SelectionSnapshot, hitAnnIds: string[] = []) {
+  private async showContextMenu(
+    _x: number,
+    _y: number,
+    snapshot: SelectionSnapshot,
+    hitAnnIds: string[] = [],
+    /** 非空表示「这是选区自动唤起的面板」，值即该选区的指纹（见 openAutoKey）。 */
+    autoKey = '',
+  ) {
     // 本次请求的代际。下面有 await，快速连续选字时可能多个请求同时在途，
     // 而它们的耗时不定 —— 可能出现「旧快照后落地、盖掉新面板」。await 之后校验一次。
     const epoch = ++this.contextMenuEpoch;
@@ -1027,6 +1102,8 @@ export class PDFPatcher {
     // 就往 body 上叠一个新面板 —— 真机表现就是「选中文本后菜单反复弹出、越叠越多，
     // 挡住正文没法继续干活」。FleurEPUB 的选区工具条是同样的单实例语义。
     this.hideContextMenu();
+    // hideContextMenu 刚把 openAutoKey 清空，这里按调用方声明重新登记
+    this.openAutoKey = autoKey;
 
     // 创建浮动面板
     const panel = createDiv({ cls: 'fleur-context-panel' });
@@ -2161,6 +2238,10 @@ export class PDFPatcher {
     if (this.boundTouchStartForMenu) {
       document.removeEventListener('touchstart', this.boundTouchStartForMenu, true);
       this.boundTouchStartForMenu = null;
+    }
+    if (this.boundTouchMoveForMenu) {
+      document.removeEventListener('touchmove', this.boundTouchMoveForMenu, true);
+      this.boundTouchMoveForMenu = null;
     }
     if (this.boundTouchEndForMenu) {
       document.removeEventListener('touchend', this.boundTouchEndForMenu, true);
