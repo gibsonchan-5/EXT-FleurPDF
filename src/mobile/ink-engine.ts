@@ -576,11 +576,24 @@ export class InkEngine {
 	 *              旧版走 HIGHLIGHT_*（32/33/34）因自由高亮自带描边已弃用；
 	 *   · 橡皮   —— 不参与参数下发（它是自建行为，见 ink-erase.ts）。
 	 *
-	 * ⚠️ 顺序敏感：下发前必须先 unselectAll。
-	 * 真机实测（0.1.0 用户反馈）：画完一笔后 pdf.js 会把新生成的编辑器留在
-	 * 选择集里，此时 um.updateParams(INK_COLOR) 会遍历 #selectedEditors 把
-	 * **历史笔迹一起改色**。先清空选择集，updateParams 就只落「默认参数」，
-	 * 只影响下一次落墨。
+	 * ⚠️ 顺序敏感：下发前必须先「提交当前会话 + 硬清空选择集」。
+	 *
+	 * 真机实测（0.2.1 小米平板反馈）：「切钢笔↔荧光笔」「换颜色」都会把**历史笔迹
+	 * 一起改掉」。两个独立成因叠加：
+	 *
+	 *   ① 绘制会话未提交 —— supportMultipleDrawings=true 时 pointerup 不生成编辑器，
+	 *      同一会话里的多条笔画共用一组 color/thickness。不先 commit，改参数会把
+	 *      这一整组笔画一起改（表现为「历史笔迹跟着变粗/变透明」）。
+	 *
+	 *   ② `um.unselectAll()` 在编辑模式下**不会真的清空选择集** —— 见 tools.js：
+	 *      只要 `#activeEditor` 存在，它 commitOrRemove 后因 `mode !== NONE` 直接
+	 *      `return`；若还有 `#currentDrawingSession` 同样提前 return。于是刚画完的
+	 *      编辑器仍留在 `#selectedEditors` 里，`updateParams` 遍历选择集把它们
+	 *      全部改色（表现为「历史笔迹跟着变色」）。
+	 *
+	 * 所以必须先 commit()（消掉 ①），再用 clearSelection() 反复 unselectAll 直到
+	 * hasSelection 为假（消掉 ②）。两步都做完，updateParams 才只落「默认参数」，
+	 * 只影响之后的新笔迹。
 	 */
 	applyPen(pen: PenSpec): InkOpResult {
 		const lib = this.constants;
@@ -589,11 +602,11 @@ export class InkEngine {
 
 		const P = lib.AnnotationEditorParamsType;
 		try {
-			// 先清掉选择集（刚画完的编辑器往往还在里面），防止历史笔迹被改色
-			try {
-				um.unselectAll?.();
-			} catch {
-				/* 未选中任何东西时忽略 */
+			if (pen.kind === 'pen' || pen.kind === 'marker') {
+				// ① 固化当前绘制会话：让已有笔画成为独立编辑器、锁住自己的参数
+				this.commit();
+				// ② 硬清空选择集：否则 updateParams 会顺着选择集改到历史笔迹
+				this.clearSelection(um);
 			}
 			if (pen.kind === 'pen' || pen.kind === 'marker') {
 				um.updateParams(P.INK_COLOR, pen.color);
@@ -604,6 +617,34 @@ export class InkEngine {
 			return { ok: true };
 		} catch (err) {
 			return { ok: false, error: err instanceof Error ? err.message : String(err) };
+		}
+	}
+
+	/**
+	 * 硬清空选择集。
+	 *
+	 * pdf.js 的 `unselectAll()` 名字骗人：在编辑模式下它**不清选择集**。
+	 * tools.js 的实现是「有 #activeEditor → commitOrRemove 后因 mode !== NONE 直接 return；
+	 * 有 #currentDrawingSession → 同样 return」，只有这两个都消掉之后才走到
+	 * `#selectedEditors.clear()`。因此单次调用几乎必然提前返回。
+	 *
+	 * 这里按 `hasSelection` 循环调用，最多 6 轮兜底（正常情况下 2~3 轮即清空），
+	 * 避免依赖 pdf.js 内部轮数假设。
+	 */
+	private clearSelection(um: any): void {
+		for (let i = 0; i < 6; i++) {
+			let has = false;
+			try {
+				has = !!um?.hasSelection;
+			} catch {
+				return;
+			}
+			if (!has) return;
+			try {
+				um.unselectAll?.();
+			} catch {
+				return;
+			}
 		}
 	}
 

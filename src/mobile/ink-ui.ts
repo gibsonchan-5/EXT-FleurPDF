@@ -17,8 +17,17 @@ import { eraseAtPoint, eraseInRect, toPdfPoint, type EraseMode } from './ink-era
 import { lassoHitEditors, lassoPolyToPdf, moveEditorBy, screenBBoxOfEditors, type ScreenPoint } from './ink-lasso';
 import { InkStorage } from './ink-storage';
 
-/** PDF 滚动容器（与 patcher.ts 用的是同一组选择器）。 */
-const SCROLL_SELECTOR = '.pdf-container, .pdf-viewer-container, .pdf-container';
+/**
+ * PDF 视图的类名候选（仅作最后兜底）。
+ *
+ * ⚠️ 不要拿这个列表去 `querySelector` 取滚动容器 —— 真机实测（0.2.1 小米平板）：
+ * Obsidian 的 `.pdf-container` 是**外层**（app.css 里 overflow: hidden），
+ * `.pdf-viewer-container` 才是 overflow: auto 的滚动容器。querySelector 返回的是
+ * DOM 里**靠前**的 `.pdf-container`，在它身上写 scrollTop 完全无效，
+ * 用户感受就是「开启手写后整个界面定住、划不动」。滚动容器一律用
+ * resolveScrollHost() 按可滚动能力向上探测。
+ */
+const SCROLL_SELECTOR = '.pdf-viewer-container, .pdfViewer';
 
 /**
  * 首版四笔。钢笔与荧光笔同走墨迹通道（0.2.0 起，荧光笔 = 大笔触 + 半透明，
@@ -170,9 +179,13 @@ export class InkUI {
 		document.body.addEventListener('click', this.onBodyClick, true);
 
 		// M3-A：首次挂载给一条指引入口在哪（只在本会话第一次出现）。
+		// 带上版本号：真机排查时「到底装没装上这一版」是最先要确认的事，
+		// 之前就吃过 BRAT 未更新却在排查已修问题的亏。
 		if (!InkUI.mountHintShown) {
 			InkUI.mountHintShown = true;
-			new Notice('FleurPDF 手写批注已就绪：点击右下角的“手写”按钮开始批注');
+			new Notice(
+				`FleurPDF 手写批注已就绪 v${ this.plugin.manifest.version }：点击右下角的“手写”按钮开始批注`,
+			);
 		}
 	}
 
@@ -1082,17 +1095,53 @@ export class InkUI {
 		}
 	}
 
+	/**
+	 * 解析真正的滚动容器。
+	 *
+	 * 从 PDF 页面元素向上找第一个「overflow 可滚动」的祖先，优先返回内容确实溢出
+	 * （scrollHeight/clientHeight 不等）的那一个；找不到溢出的就退化为第一个可滚动的；
+	 * 都没有才回落到类名候选。这样不依赖 Obsidian 的 DOM 层级细节 ——
+	 * 那个层级在桌面 / 移动 / 不同版本之间并不一致。
+	 */
+	private resolveScrollHost(): HTMLElement | null {
+		const inner =
+			(document.querySelector('.pdfViewer .page') as HTMLElement | null) ??
+			this.engine.getPageElement(1);
+		let fallback: HTMLElement | null = null;
+		let el: HTMLElement | null = inner?.parentElement ?? null;
+		while (el && el !== document.body) {
+			const cs = getComputedStyle(el);
+			if (/(auto|scroll)/.test(`${ cs.overflowY } ${ cs.overflowX }`)) {
+				if (!fallback) fallback = el;
+				const overflows =
+					el.scrollHeight > el.clientHeight + 1 || el.scrollWidth > el.clientWidth + 1;
+				if (overflows) return el;
+			}
+			el = el.parentElement;
+		}
+		return fallback ?? (document.querySelector(SCROLL_SELECTOR) as HTMLElement | null);
+	}
+
 	private attachTouchRouter(): void {
 		if (this.touchRouterDetach) return;
 
-		const host =
-			(document.querySelector(SCROLL_SELECTOR) as HTMLElement | null) ??
-			(this.engine.getPageElement(1)?.parentElement ?? null);
-		if (!host) return;
-		this.scrollHost = host;
+		this.scrollHost = this.resolveScrollHost();
+		if (!this.scrollHost) return;
+
+		/** 触点是否落在 PDF 区域内（笔盒 / 侧边栏等自绘 UI 不在此范围内）。 */
+		const inPdfArea = (target: EventTarget | null): boolean => {
+			const el = target as HTMLElement | null;
+			return !!el?.closest?.('.pdf-viewer-container, .pdfViewer, .pdf-container');
+		};
 
 		const onDown = (e: PointerEvent): void => {
 			if (e.pointerType !== 'touch') return;
+			if (!inPdfArea(e.target)) return;
+			// 视图可能被重建（切换文件 / 重新打开），宿主失连时重新探测
+			if (!this.scrollHost?.isConnected) {
+				this.scrollHost = this.resolveScrollHost();
+				if (!this.scrollHost) return;
+			}
 			this.touchPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
 			if (!this.fingerScroll) {
@@ -1120,6 +1169,8 @@ export class InkUI {
 			if (!this.touchPointers.has(e.pointerId)) return;
 			this.touchPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 			if (!this.touchScrolling) return;
+			const host = this.scrollHost;
+			if (!host) return;
 			e.stopPropagation();
 			e.preventDefault();
 			host.scrollTop = this.touchStartScrollTop - (this.touchCenterY() - this.touchStartY);
@@ -1136,13 +1187,15 @@ export class InkUI {
 			}
 		};
 
-		host.addEventListener('pointerdown', onDown, { capture: true });
+		// 全部挂在 window 捕获阶段：滚动宿主可能因视图重建而更换，
+		// 挂死在某个元素上会在更换后失效（手指划不动的隐性成因之一）。
+		window.addEventListener('pointerdown', onDown, { capture: true, passive: false });
 		window.addEventListener('pointermove', onMove, { capture: true, passive: false });
 		window.addEventListener('pointerup', onUp, { capture: true });
 		window.addEventListener('pointercancel', onUp, { capture: true });
 
 		this.touchRouterDetach = () => {
-			host.removeEventListener('pointerdown', onDown, { capture: true });
+			window.removeEventListener('pointerdown', onDown, { capture: true });
 			window.removeEventListener('pointermove', onMove, { capture: true });
 			window.removeEventListener('pointerup', onUp, { capture: true });
 			window.removeEventListener('pointercancel', onUp, { capture: true });

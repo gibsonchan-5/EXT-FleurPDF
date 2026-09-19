@@ -66,6 +66,20 @@ const flattened = await (postcss.default ?? postcss)([flatten()])
 const darkOverrides = []; // { selector, prop, dark }
 const root = (postcss.default ?? postcss).parse(flattened);
 
+// ── 2.5 需要厂商前缀的属性补 -webkit- 双写 ──
+// mask 系列：pdf.js 的工具栏图标全靠 `mask-image: var(--xxx)` + background-color
+// 实现（.delete::before / .highlightButton::before 等）。而**无前缀的 mask-image
+// 直到 Chromium 120（2023-12）才默认支持**，Android / iOS 的 WebView 版本完全不可控。
+// 前缀缺失时整条声明被丢弃 → 图标位置只剩空白或纯色块，真机表现就是
+// 「工具栏在、图标几乎看不见」（0.2.1 小米平板实测）。
+// user-select：iOS Safari / 旧 WebKit 仍需 -webkit- 前缀。
+// -webkit-* 在 Chromium / WebKit 全版本可用，双写对现代浏览器无副作用。
+const PREFIXED_PROP = /^(mask(-|$)|user-select$)/;
+root.walkDecls((decl) => {
+	if (/^-webkit-/.test(decl.prop) || !PREFIXED_PROP.test(decl.prop)) return;
+	decl.cloneBefore({ prop: `-webkit-${ decl.prop }` });
+});
+
 function splitLightDark(value) {
 	// 只处理顶层（非嵌套括号内）的 light-dark(...)；pdf.js 表中没有嵌套用法
 	const m = value.match(/light-dark\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)/);

@@ -1,7 +1,7 @@
 {
 	"id": "fleur-pdf-mobile",
 	"name": "FleurPDF Mobile",
-	"version": "0.2.1",
+	"version": "0.2.2",
 	"minAppVersion": "1.7.2",
 	"description": "Mobile handwriting annotation for FleurPDF. Experimental build, install via BRAT.",
 	"author": "gibsonchan-5",
