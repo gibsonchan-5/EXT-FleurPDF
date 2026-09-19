@@ -1,4 +1,4 @@
-// 移动端手写批注的 UI 层：模式切换 + 笔盒 + 双指滚动。
+// 移动端手写批注的 UI 层：模式切换 + 笔盒 + 手指滚动（触摸路由）。
 //
 // 设计原则（对齐 fleur-pdf 既有设计语言与 FleurEPUB 的移动端做法）：
 //   · 只在 isMobileUI() 为真时创建，桌面端不实例化、不注入样式；
@@ -13,17 +13,21 @@
 import { Notice, setIcon } from 'obsidian';
 import type FleurPDFPlugin from '../main';
 import type { InkEngine, PenSpec } from './ink-engine';
-import { eraseAtPoint, toPdfPoint } from './ink-erase';
+import { eraseAtPoint, eraseInRect, toPdfPoint, type EraseMode } from './ink-erase';
 import { lassoHitEditors, lassoPolyToPdf, moveEditorBy, screenBBoxOfEditors, type ScreenPoint } from './ink-lasso';
 import { InkStorage } from './ink-storage';
 
 /** PDF 滚动容器（与 patcher.ts 用的是同一组选择器）。 */
 const SCROLL_SELECTOR = '.pdf-container, .pdf-viewer-container, .pdf-container';
 
-/** 首版四笔。钢笔走墨迹通道，荧光笔走自由高亮通道，橡皮是自建行为，套索圈选移动。 */
+/**
+ * 首版四笔。钢笔与荧光笔同走墨迹通道（0.2.0 起，荧光笔 = 大笔触 + 半透明，
+ * 不再走 pdf.js 自由高亮 —— 那条通道的 Outline 多边形渲染自带一圈描边）。
+ * 荧光笔的半透明感来自 opacity 0.4（GoodNotes 同款视觉）。
+ */
 export const DEFAULT_PENS: PenSpec[] = [
 	{ kind: 'pen', color: '#1f1f1f', thickness: 3, opacity: 1 },
-	{ kind: 'marker', color: '#ffe066', thickness: 14, opacity: 1 },
+	{ kind: 'marker', color: '#ffe066', thickness: 14, opacity: 0.4 },
 	{ kind: 'eraser', color: '', thickness: 16, opacity: 1 },
 	{ kind: 'lasso', color: '', thickness: 12, opacity: 1 },
 ];
@@ -35,6 +39,15 @@ const MARKER_COLORS = ['#ffe066', '#a5f3b0', '#9fd8ff', '#ffb3c8', '#e0c3ff'];
 /** 粗细档位（PDF 用户空间单位）。 */
 const PEN_SIZES = [2, 3, 5, 8];
 const MARKER_SIZES = [10, 14, 20, 28];
+/** 橡皮大小档位（命中半径，PDF 用户空间单位）。 */
+const ERASER_SIZES = [8, 12, 20, 32];
+
+/** 擦除模式的展示名。 */
+const ERASE_MODE_LABEL: Record<EraseMode, string> = {
+	pixel: '像素擦除',
+	stroke: '笔画擦除',
+	select: '选区擦除',
+};
 
 /** 笔的种类 → 图标 / 无障碍名（lucide 图标名，Obsidian setIcon 消费）。 */
 const PEN_ICON: Record<PenSpec['kind'], string> = {
@@ -65,8 +78,10 @@ export class InkUI {
 	private umMissing = false;
 	/** 当前选中的笔序号（对应 DEFAULT_PENS）。 */
 	private penIndex = 0;
-	/** 每支笔的当前参数（颜色/粗细按笔独立记忆）。 */
-	private readonly pens: PenSpec[] = DEFAULT_PENS.map((p) => ({ ...p }));
+	/** 每支笔的当前参数（颜色/粗细按笔独立记忆，0.2.0 起持久化到插件设置）。 */
+	private readonly pens: PenSpec[];
+	/** 当前擦除模式（仅橡皮笔生效，0.2.0 起持久化）。 */
+	private eraserMode: EraseMode;
 	/** 手写模式激活期间是否只允许笔输入（真机笔 vs 手指）。 */
 	private readonly storage: InkStorage;
 
@@ -75,6 +90,45 @@ export class InkUI {
 		private engine: InkEngine,
 	) {
 		this.storage = new InkStorage(plugin.app);
+		this.pens = InkUI.loadPens(plugin);
+		this.eraserMode = plugin.settings.inkEraserMode ?? 'stroke';
+	}
+
+	/* ============================ 设置持久化 ============================ */
+
+	/**
+	 * 从插件设置恢复笔参数。结构变化（笔数不符 / kind 对不上）时回落默认值，
+	 * 保证旧数据或手改的 data.json 不会让笔盒坏掉。
+	 */
+	private static loadPens(plugin: FleurPDFPlugin): PenSpec[] {
+		const saved = plugin.settings.inkPens;
+		if (
+			Array.isArray(saved) &&
+			saved.length === DEFAULT_PENS.length &&
+			saved.every((p, i) => p && p.kind === DEFAULT_PENS[i].kind)
+		) {
+			return saved.map((p, i) => ({
+				kind: p.kind,
+				color: String(p.color ?? ''),
+				thickness: Number(p.thickness) || DEFAULT_PENS[i].thickness,
+				opacity: Number.isFinite(Number(p.opacity)) ? Number(p.opacity) : 1,
+			}));
+		}
+		return DEFAULT_PENS.map((p) => ({ ...p }));
+	}
+
+	/** 把笔参数与橡皮配置写回插件设置（每次改动后调用，静默失败不影响使用）。 */
+	private persist(): void {
+		this.plugin.settings.inkPens = this.pens.map((p) => ({ ...p }));
+		this.plugin.settings.inkEraserMode = this.eraserMode;
+		void this.plugin.saveSettings().catch(() => {
+			/* 写盘失败仅影响下次会话的记忆，不打断当前使用 */
+		});
+	}
+
+	/** 手指滚动开关（实时读设置，设置页改动即时生效，无需重建 InkUI）。 */
+	private get fingerScroll(): boolean {
+		return this.plugin.settings.inkFingerScroll !== false;
 	}
 
 	/* ============================ 挂载 / 卸载 ============================ */
@@ -172,9 +226,9 @@ export class InkUI {
 		this.active = true;
 		document.body.addClass('fleur-pdf-ink-active');
 		this.syncSwitcher();
-		this.syncMarkerClass();
 		this.buildPenBar();
-		this.attachTwoFingerScroll();
+		this.attachGestureShield();
+		this.attachTouchRouter();
 		// 按当前笔恢复输入接管（上次退出时可能停在橡皮 / 套索上）
 		const activeKind = this.pens[this.penIndex].kind;
 		this.setPenInputMode(activeKind === 'eraser' ? 'eraser' : activeKind === 'lasso' ? 'lasso' : 'draw');
@@ -196,14 +250,18 @@ export class InkUI {
 		this.engine.exit();
 
 		this.clearLasso();
+		this.clearEraseRect();
 
 		this.active = false;
 		document.body.removeClass('fleur-pdf-ink-active');
-		document.body.removeClass('fleur-pdf-ink-marker');
 		this.syncSwitcher();
-		this.detachTwoFingerScroll();
+		this.detachPenInput();
+		this.detachGestureShield();
+		this.detachTouchRouter();
 		this.penBar?.remove();
 		this.penBar = null;
+		// 退出时把当前笔参数落盘（下次进入原样恢复）
+		this.persist();
 	}
 
 	/** 把手写层的待保存批注写回 PDF。 */
@@ -271,9 +329,10 @@ export class InkUI {
 		});
 
 		// ── 粗细 ──
+		const isEraser = this.pens[this.penIndex].kind === 'eraser';
 		const sizeBtn = bar.createDiv('fleur-pdf-ink-btn');
 		setIcon(sizeBtn, 'circle-dot');
-		sizeBtn.setAttribute('aria-label', '粗细');
+		sizeBtn.setAttribute('aria-label', isEraser ? '橡皮大小' : '粗细');
 		const sizePop = this.buildSizePop();
 		bar.appendChild(sizePop);
 		sizeBtn.addEventListener('click', (e) => {
@@ -281,6 +340,20 @@ export class InkUI {
 			this.closePops(sizePop);
 			sizePop.toggleClass('is-open', !sizePop.hasClass('is-open'));
 		});
+
+		// ── 擦除模式（仅橡皮生效）：像素 / 笔画 / 选区 ──
+		if (isEraser) {
+			const modeBtn = bar.createDiv('fleur-pdf-ink-btn');
+			setIcon(modeBtn, 'box-select');
+			modeBtn.setAttribute('aria-label', `擦除模式：${ERASE_MODE_LABEL[this.eraserMode]}`);
+			const modePop = this.buildEraseModePop();
+			bar.appendChild(modePop);
+			modeBtn.addEventListener('click', (e) => {
+				e.stopPropagation();
+				this.closePops(modePop);
+				modePop.toggleClass('is-open', !modePop.hasClass('is-open'));
+			});
+		}
 
 		bar.createDiv('fleur-pdf-ink-sep');
 
@@ -355,19 +428,35 @@ export class InkUI {
 	}
 
 	private buildSizePop(): HTMLElement {
+		const pen = this.pens[this.penIndex];
 		const pop = createDiv('fleur-pdf-ink-pop fleur-pdf-ink-sizes');
-		const isMarker = this.pens[this.penIndex].kind === 'marker';
-		const sizes = isMarker ? MARKER_SIZES : PEN_SIZES;
+		const sizes = pen.kind === 'eraser' ? ERASER_SIZES : pen.kind === 'marker' ? MARKER_SIZES : PEN_SIZES;
 		for (const s of sizes) {
 			const item = pop.createDiv('fleur-pdf-ink-size');
 			item.createDiv('fleur-pdf-ink-size-dot').setCssStyles({
 				width: `${Math.min(4 + s, 18)}px`,
 				height: `${Math.min(4 + s, 18)}px`,
 			});
-			if (s === this.pens[this.penIndex].thickness) item.addClass('is-active');
+			if (s === pen.thickness) item.addClass('is-active');
 			item.addEventListener('click', (e) => {
 				e.stopPropagation();
 				void this.setSize(s);
+			});
+		}
+		return pop;
+	}
+
+	/** 擦除模式弹层（像素 / 笔画 / 选区）。 */
+	private buildEraseModePop(): HTMLElement {
+		const pop = createDiv('fleur-pdf-ink-pop fleur-pdf-ink-modes');
+		const modes: EraseMode[] = ['pixel', 'stroke', 'select'];
+		for (const m of modes) {
+			const item = pop.createDiv('fleur-pdf-ink-size fleur-pdf-ink-mode');
+			item.setText(ERASE_MODE_LABEL[m]);
+			if (m === this.eraserMode) item.addClass('is-active');
+			item.addEventListener('click', (e) => {
+				e.stopPropagation();
+				this.setEraseMode(m);
 			});
 		}
 		return pop;
@@ -388,36 +477,34 @@ export class InkUI {
 			// 但若当前不在任何编辑模式（首笔就是套索），先进墨迹模式让编辑器存在。
 			if (!this.engine.getMode()) this.engine.enterInk();
 			this.setPenInputMode('lasso');
-		} else if (pen.kind === 'marker') {
-			this.engine.enterMarker();
-			this.setPenInputMode('draw');
 		} else {
+			// 钢笔与荧光笔同走墨迹通道（0.2.0 起）；切换时会按笔重下发参数
 			this.engine.enterInk();
 			this.setPenInputMode('draw');
 		}
-		this.syncMarkerClass();
+		this.persist();
 		this.refreshPenBar();
-	}
-
-	/**
-	 * 荧光笔选中态同步到 body class。
-	 * 对应 ink-css.ts 里的规则：关掉 textLayer span 的指针事件，
-	 * 让荧光笔的拖拽永远走 pdf.js 的自由高亮闸门（而不是选字 marquee）。
-	 */
-	private syncMarkerClass(): void {
-		const on = this.active && this.pens[this.penIndex].kind === 'marker';
-		document.body.toggleClass('fleur-pdf-ink-marker', on);
 	}
 
 	private async setColor(color: string): Promise<void> {
 		this.pens[this.penIndex].color = color;
 		await this.applyActivePen();
+		this.persist();
 		this.refreshPenBar();
 	}
 
 	private async setSize(size: number): Promise<void> {
 		this.pens[this.penIndex].thickness = size;
 		await this.applyActivePen();
+		this.persist();
+		this.refreshPenBar();
+	}
+
+	/** 切换擦除模式（仅橡皮生效；随切换写回设置）。 */
+	private setEraseMode(mode: EraseMode): void {
+		this.eraserMode = mode;
+		this.clearEraseRect();
+		this.persist();
 		this.refreshPenBar();
 	}
 
@@ -459,21 +546,43 @@ export class InkUI {
 		const host = this.scrollHost ?? document.body;
 
 		const onDown = (e: PointerEvent) => {
-			// 双指手势优先给滚动逻辑（它在捕获阶段，正常会先于这里被处理）
+			// 双指手势优先给滚动逻辑（它在捕获阶段、注册更早，正常会先于这里被处理）
 			if (e.isPrimary === false) return;
-			this.eraserDown = true;
-			this.lastErasePt = null;
-			void this.eraseAt(e.clientX, e.clientY);
+			if (this.eraserMode === 'select') {
+				// 选区擦除：起手记起点，拖出虚线矩形
+				this.eraseRectStart = { x: e.clientX, y: e.clientY };
+				this.ensureEraseRect();
+				this.updateEraseRect(e.clientX, e.clientY);
+			} else {
+				this.eraserDown = true;
+				this.lastErasePt = null;
+				void this.eraseAt(e.clientX, e.clientY);
+			}
 			e.preventDefault();
 			e.stopPropagation();
 		};
 		const onMove = (e: PointerEvent) => {
+			if (this.eraserMode === 'select') {
+				if (!this.eraseRectEl) return;
+				e.preventDefault();
+				e.stopPropagation();
+				this.updateEraseRect(e.clientX, e.clientY);
+				return;
+			}
 			if (!this.eraserDown) return;
 			e.preventDefault();
 			e.stopPropagation();
 			void this.eraseAt(e.clientX, e.clientY);
 		};
-		const onUp = () => {
+		const onUp = (e: PointerEvent) => {
+			if (this.eraserMode === 'select') {
+				if (!this.eraseRectEl) return;
+				const start = this.eraseRectStart;
+				const end = { x: e.clientX, y: e.clientY };
+				this.clearEraseRect();
+				void this.finishEraseRect(start, end);
+				return;
+			}
 			this.eraserDown = false;
 			this.lastErasePt = null;
 		};
@@ -491,23 +600,24 @@ export class InkUI {
 		};
 	}
 
-	/* ---------------- 橡皮擦除调度 ----------------
-	 * 灵敏度的三个来源（v0.5 用户实测「不太灵敏」后修正）：
-	 *  1. 快速拖动时 pointermove 事件之间有间距 —— 旧实现只在事件点擦，
-	 *     中间的笔画整段漏掉。现在沿「上一点 → 当前点」线段按步长插值补点；
-	 *  2. 每次命中都涉及 serialize/deserialize 重建，异步 —— 旧实现用 45ms
-	 *     时间节流硬拦，反而放大了间距问题。现在改为忙队列：进行中只记
-	 *     最新坐标，结束后立刻补擦；
-	 *  3. 命中半径过小 —— 放宽到 max(10, 笔粗 × 1.25)。
+	/* ---------------- 橡皮擦除调度（像素 / 笔画） ----------------
+	 * 灵敏度的三个来源（0.1.0 真机实测「不太灵敏」后继续修正）：
+	 *  1. 快速拖动时 pointermove 事件之间有间距 —— 沿「上一点 → 当前点」
+	 *     线段按步长插值补点；
+	 *  2. 每次命中都涉及 serialize/deserialize 重建，异步 —— 忙队列进行中
+	 *     只记最新坐标会漏掉中间点（快速画 Z 字时中段漏擦）。0.2.0 改为
+	 *     待办点队列：进行中把所有经过的点按序攒下，结束后逐点补擦；
+	 *  3. 一次命中只擦一笔 —— 现在一次调用擦掉半径内**全部**笔画
+	 *     （见 ink-erase.eraseAtPoint），拖过多笔时不再需要反复经过。
 	 */
 	private eraserDown = false;
 	private eraserBusy = false;
-	private pendingErase: { x: number; y: number } | null = null;
+	private pendingErasePts: Array<{ x: number; y: number }> = [];
 	private lastErasePt: { x: number; y: number } | null = null;
 
 	private async eraseAt(clientX: number, clientY: number): Promise<void> {
 		if (this.eraserBusy) {
-			this.pendingErase = { x: clientX, y: clientY };
+			this.pendingErasePts.push({ x: clientX, y: clientY });
 			return;
 		}
 		this.eraserBusy = true;
@@ -526,13 +636,21 @@ export class InkUI {
 			this.lastErasePt = { x: clientX, y: clientY };
 		} finally {
 			this.eraserBusy = false;
-			const p = this.pendingErase;
-			this.pendingErase = null;
-			if (p && this.eraserDown) void this.eraseAt(p.x, p.y);
+			// 按序补擦攒下的待办点（不再只取最后一个）
+			const queue = this.pendingErasePts;
+			this.pendingErasePts = [];
+			if (queue.length && this.eraserDown) {
+				void (async () => {
+					for (const p of queue) {
+						if (!this.eraserDown) break;
+						await this.eraseAt(p.x, p.y);
+					}
+				})();
+			}
 		}
 	}
 
-	/** 在单个视口坐标点擦一次（旧 eraseAt 去掉时间节流后的本体）。 */
+	/** 在单个视口坐标点按当前模式擦一次。 */
 	private async eraseSingle(clientX: number, clientY: number): Promise<void> {
 		const pageEl = (document.elementFromPoint(clientX, clientY) as HTMLElement | null)?.closest<HTMLElement>('.page');
 		const pageNumber = Number(pageEl?.dataset.pageNumber ?? '1');
@@ -541,7 +659,70 @@ export class InkUI {
 		const point = toPdfPoint(this.engine, clientX, clientY, pageNumber);
 		if (!point) return;
 
-		await eraseAtPoint(this.engine, point, { radius: this.pens[this.penIndex].thickness });
+		await eraseAtPoint(this.engine, point, {
+			radius: this.pens[this.penIndex].thickness,
+			mode: this.eraserMode === 'pixel' ? 'pixel' : 'stroke',
+		});
+	}
+
+	/* ---------------- 选区擦除（矩形拖选） ---------------- */
+
+	private eraseRectEl: HTMLElement | null = null;
+	private eraseRectStart: { x: number; y: number } = { x: 0, y: 0 };
+
+	private ensureEraseRect(): void {
+		if (this.eraseRectEl?.isConnected) return;
+		const el = document.body.createDiv('fleur-pdf-erase-rect');
+		this.eraseRectEl = el;
+	}
+
+	private updateEraseRect(x: number, y: number): void {
+		const el = this.eraseRectEl;
+		if (!el) return;
+		const s = this.eraseRectStart;
+		const minX = Math.min(s.x, x);
+		const minY = Math.min(s.y, y);
+		el.setCssStyles({
+			left: `${minX}px`,
+			top: `${minY}px`,
+			width: `${Math.abs(x - s.x)}px`,
+			height: `${Math.abs(y - s.y)}px`,
+			display: 'block',
+		});
+	}
+
+	private clearEraseRect(): void {
+		this.eraseRectEl?.remove();
+		this.eraseRectEl = null;
+	}
+
+	/** 选区擦除收尾：矩形换算到起始页的 PDF 坐标，删除相交笔画。 */
+	private async finishEraseRect(
+		start: { x: number; y: number },
+		end: { x: number; y: number },
+	): Promise<void> {
+		// 拖动距离过小视为误触
+		if (Math.hypot(end.x - start.x, end.y - start.y) < 10) return;
+
+		// 以起点所在页为准（v1 约束：选区不跨页）
+		const pageEl = (document.elementFromPoint(start.x, start.y) as HTMLElement | null)?.closest<HTMLElement>('.page');
+		const pageNumber = Number(pageEl?.dataset.pageNumber ?? '1');
+		if (!Number.isFinite(pageNumber) || pageNumber < 1) return;
+
+		const p1 = toPdfPoint(this.engine, start.x, start.y, pageNumber);
+		const p2 = toPdfPoint(this.engine, end.x, end.y, pageNumber);
+		if (!p1 || !p2 || p1.pageIndex !== p2.pageIndex) return;
+
+		const r = await eraseInRect(this.engine, p1.pageIndex, {
+			minX: Math.min(p1.x, p2.x),
+			minY: Math.min(p1.y, p2.y),
+			maxX: Math.max(p1.x, p2.x),
+			maxY: Math.max(p1.y, p2.y),
+		});
+		if (r.changed) {
+			this.engine.commit();
+			new Notice(`已擦除 ${r.removedStrokes} 笔`);
+		}
 	}
 
 	/* ============================ 套索 ============================ */
@@ -780,18 +961,129 @@ export class InkUI {
 		this.lassoPathEl = null;
 	}
 
-	/* ============================ 双指滚动（R9） ============================ */
-
-	/**
-	 * 手写模式下 pdf.js 独占触摸（实测 scrollTop Δ 恒为 0）。
-	 * 这里在捕获阶段接管第二个触点：取消已起手的绘制，然后自己驱动滚动。
+	/* ============================ 触摸层（R9 → 0.2.0 重构） ============================
 	 *
-	 * 为什么必须「取消已起手的绘制」：第一个手指的 pointerdown 一定先于第二个到达
-	 * pdf.js（pointerdown 早于 touchstart），此时它已经开始画了。第二个触点出现后
-	 * 向编辑层补发一个 pointercancel，是 pdf.js 自己的「放弃本笔」语义。
+	 * 两层配合，解决两件事：
+	 *
+	 * A. 手势盾（attachGestureShield）—— 0.1.0 真机反馈：书写时左右滑动会呼出
+	 *    Obsidian 的功能区 / 侧边栏。根因：Obsidian 的边缘滑手势监听 document 级
+	 *    touch 事件，而书写通道（pdf.js 的 pointer、橡皮/套索的自建 pointer）都
+	 *    拦不住 touch。盾在 **window 捕获阶段** 拦 touch：window 比 document 更靠
+	 *    传播路径上游，stopPropagation 后手势识别器再也收不到事件。
+	 *    pointer 事件由输入系统独立派发，不受影响 —— pdf.js 书写照常。
+	 *
+	 * B. 触摸路由（attachTouchRouter）—— GoodNotes 式防误触：手写模式下
+	 *    手指（pointerType=touch）滚动页面，笔（pointerType=pen）才落墨。
+	 *    手指的 pointerdown 在 host 捕获阶段被拦下（pdf.js 看不到，自然不画），
+	 *    然后自己驱动 scrollTop/scrollLeft。可在设置里关掉（关掉后恢复 0.1.0
+	 *    的「触摸绘制 + 双指滚动」语义）。
 	 */
-	private attachTwoFingerScroll(): void {
-		if (this.detachTwoFinger) return;
+
+	/** 手势盾的卸载器。 */
+	private gestureShieldDetach: (() => void) | null = null;
+
+	private attachGestureShield(): void {
+		if (this.gestureShieldDetach) return;
+
+		const inPdfArea = (target: EventTarget | null): boolean => {
+			const el = target as HTMLElement | null;
+			return !!el && !!this.scrollHost && (el === this.scrollHost || this.scrollHost.contains(el));
+		};
+
+		const onTouchStart = (e: TouchEvent): void => {
+			if (!this.active || !inPdfArea(e.target)) return;
+			// 阻断 Obsidian 的边缘滑动 / 手势识别（document 级监听全部收不到）
+			e.stopPropagation();
+		};
+		const onTouchMove = (e: TouchEvent): void => {
+			if (!this.active || !inPdfArea(e.target)) return;
+			e.stopPropagation();
+			// 阻掉 WebKit 原生滚动与回弹 —— 滚动由触摸路由自己驱动
+			e.preventDefault();
+		};
+		const onTouchEnd = (e: TouchEvent): void => {
+			if (!this.active || !inPdfArea(e.target)) return;
+			e.stopPropagation();
+		};
+
+		window.addEventListener('touchstart', onTouchStart, { capture: true, passive: true });
+		window.addEventListener('touchmove', onTouchMove, { capture: true, passive: false });
+		window.addEventListener('touchend', onTouchEnd, { capture: true, passive: true });
+		window.addEventListener('touchcancel', onTouchEnd, { capture: true, passive: true });
+
+		this.gestureShieldDetach = () => {
+			window.removeEventListener('touchstart', onTouchStart, { capture: true });
+			window.removeEventListener('touchmove', onTouchMove, { capture: true });
+			window.removeEventListener('touchend', onTouchEnd, { capture: true });
+			window.removeEventListener('touchcancel', onTouchEnd, { capture: true });
+		};
+	}
+
+	private detachGestureShield(): void {
+		this.gestureShieldDetach?.();
+		this.gestureShieldDetach = null;
+	}
+
+	/* ---- 触摸路由 ---- */
+
+	private touchRouterDetach: (() => void) | null = null;
+	private readonly touchPointers = new Map<number, { x: number; y: number }>();
+	private touchScrolling = false;
+	private touchStartY = 0;
+	private touchStartX = 0;
+	private touchStartScrollTop = 0;
+	private touchStartScrollLeft = 0;
+
+	private touchCenterY(): number {
+		let sum = 0;
+		for (const p of this.touchPointers.values()) sum += p.y;
+		return this.touchPointers.size ? sum / this.touchPointers.size : 0;
+	}
+
+	private touchCenterX(): number {
+		let sum = 0;
+		for (const p of this.touchPointers.values()) sum += p.x;
+		return this.touchPointers.size ? sum / this.touchPointers.size : 0;
+	}
+
+	private beginTouchScroll(): void {
+		const host = this.scrollHost;
+		if (!host) return;
+		this.touchScrolling = true;
+		this.touchStartY = this.touchCenterY();
+		this.touchStartX = this.touchCenterX();
+		this.touchStartScrollTop = host.scrollTop;
+		this.touchStartScrollLeft = host.scrollLeft;
+	}
+
+	/** 剩余触点继续滚动时重设基准，避免跳动。 */
+	private rebaseTouchScroll(): void {
+		const host = this.scrollHost;
+		if (!host || !this.touchScrolling) return;
+		this.touchStartY = this.touchCenterY();
+		this.touchStartX = this.touchCenterX();
+		this.touchStartScrollTop = host.scrollTop;
+		this.touchStartScrollLeft = host.scrollLeft;
+	}
+
+	/** 让 pdf.js 放弃已经开始的那一笔（第二触点出现时调用）。 */
+	private cancelInkStroke(): void {
+		const host = this.scrollHost;
+		if (!host) return;
+		const layerDiv = host.querySelector('.annotationEditorLayer');
+		for (const id of this.touchPointers.keys()) {
+			try {
+				layerDiv?.dispatchEvent(
+					new PointerEvent('pointercancel', { pointerId: id, bubbles: true, cancelable: true }),
+				);
+			} catch {
+				/* 老 WebView 不支持 PointerEvent 构造时忽略 */
+			}
+		}
+	}
+
+	private attachTouchRouter(): void {
+		if (this.touchRouterDetach) return;
 
 		const host =
 			(document.querySelector(SCROLL_SELECTOR) as HTMLElement | null) ??
@@ -799,57 +1091,49 @@ export class InkUI {
 		if (!host) return;
 		this.scrollHost = host;
 
-		const pointers = new Map<number, { x: number; y: number }>();
-		let scrolling = false;
-		let startY = 0;
-		let startScrollTop = 0;
-
-		const centerY = () => {
-			let sum = 0;
-			for (const p of pointers.values()) sum += p.y;
-			return pointers.size ? sum / pointers.size : 0;
-		};
-
-		const beginScroll = (): void => {
-			scrolling = true;
-			startY = centerY();
-			startScrollTop = host.scrollTop;
-			// 让 pdf.js 放弃已经开始的那一笔
-			const layerDiv = host.querySelector('.annotationEditorLayer');
-			for (const id of pointers.keys()) {
-				try {
-					layerDiv?.dispatchEvent(
-						new PointerEvent('pointercancel', { pointerId: id, bubbles: true, cancelable: true }),
-					);
-				} catch {
-					/* 老 WebView 不支持 PointerEvent 构造时忽略 */
-				}
-			}
-		};
-
-		const onDown = (e: PointerEvent) => {
+		const onDown = (e: PointerEvent): void => {
 			if (e.pointerType !== 'touch') return;
-			pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-			if (pointers.size === 2) {
-				beginScroll();
-				e.stopPropagation();
-				e.preventDefault();
-			}
-		};
+			this.touchPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
-		const onMove = (e: PointerEvent) => {
-			if (!pointers.has(e.pointerId)) return;
-			pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-			if (!scrolling) return;
+			if (!this.fingerScroll) {
+				// 关闭手指滚动：维持 0.1.0 语义 —— 触摸绘制，双指接管滚动
+				if (this.touchPointers.size === 2) {
+					this.beginTouchScroll();
+					// 第一个触点可能已经落墨，让 pdf.js 放弃本笔
+					this.cancelInkStroke();
+					e.stopPropagation();
+					e.preventDefault();
+				}
+				return;
+			}
+
+			// 手指滚动（GoodNotes 式防误触）：手指不再落墨，改为驱动滚动。
+			// stopPropagation 让 pdf.js 的编辑层收不到这个 pointerdown —— 手指画不出笔迹。
+			if (this.touchPointers.size === 1) {
+				this.beginTouchScroll();
+			}
 			e.stopPropagation();
 			e.preventDefault();
-			host.scrollTop = startScrollTop - (centerY() - startY);
 		};
 
-		const onUp = (e: PointerEvent) => {
-			if (!pointers.has(e.pointerId)) return;
-			pointers.delete(e.pointerId);
-			if (pointers.size < 2) scrolling = false;
+		const onMove = (e: PointerEvent): void => {
+			if (!this.touchPointers.has(e.pointerId)) return;
+			this.touchPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+			if (!this.touchScrolling) return;
+			e.stopPropagation();
+			e.preventDefault();
+			host.scrollTop = this.touchStartScrollTop - (this.touchCenterY() - this.touchStartY);
+			host.scrollLeft = this.touchStartScrollLeft - (this.touchCenterX() - this.touchStartX);
+		};
+
+		const onUp = (e: PointerEvent): void => {
+			if (!this.touchPointers.has(e.pointerId)) return;
+			this.touchPointers.delete(e.pointerId);
+			if (this.touchPointers.size === 0) {
+				this.touchScrolling = false;
+			} else if (this.touchScrolling) {
+				this.rebaseTouchScroll();
+			}
 		};
 
 		host.addEventListener('pointerdown', onDown, { capture: true });
@@ -857,21 +1141,27 @@ export class InkUI {
 		window.addEventListener('pointerup', onUp, { capture: true });
 		window.addEventListener('pointercancel', onUp, { capture: true });
 
-		this.detachTwoFinger = () => {
+		this.touchRouterDetach = () => {
 			host.removeEventListener('pointerdown', onDown, { capture: true });
 			window.removeEventListener('pointermove', onMove, { capture: true });
 			window.removeEventListener('pointerup', onUp, { capture: true });
 			window.removeEventListener('pointercancel', onUp, { capture: true });
+			this.touchPointers.clear();
+			this.touchScrolling = false;
 			this.scrollHost = null;
 		};
 	}
 
-	private detachTwoFingerScroll(): void {
+	private detachTouchRouter(): void {
+		this.touchRouterDetach?.();
+		this.touchRouterDetach = null;
+	}
+
+	/** 卸载橡皮 / 套索的输入接管（退出手写模式时调用，避免监听器跨模式残留）。 */
+	private detachPenInput(): void {
 		this.eraserDetach?.();
 		this.eraserDetach = null;
 		this.lassoDetach?.();
 		this.lassoDetach = null;
-		this.detachTwoFinger?.();
-		this.detachTwoFinger = null;
 	}
 }

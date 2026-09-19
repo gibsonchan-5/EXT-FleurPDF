@@ -526,11 +526,19 @@ export class InkEngine {
 		return this.setMode(this.constants?.AnnotationEditorType.INK ?? 15);
 	}
 
-	/** 进入荧光笔模式（自由高亮）。 */
+	/**
+	 * 进入荧光笔模式。
+	 *
+	 * ⚠️ 0.2.0 起荧光笔**不再**走 pdf.js 的 HIGHLIGHT(9) 自由高亮通道。
+	 * 原因：自由高亮的渲染是「Outline 多边形填充」——它把粗描边转成闭合多边形
+	 * 再半透明填充，渲染层自带一圈同色描边（真机用户实测「像选区图层、有边框」）。
+	 * 这条描边长在 pdf.js 的绘制逻辑与导出的外观流里，CSS 去不掉。
+	 *
+	 * 现在与 GoodNotes 同语义：荧光笔 = 钢笔调大笔触（INK 通道 + 半透明），
+	 * 渲染是一条真正的粗笔画，没有任何边框。
+	 */
 	enterMarker(): InkOpResult {
-		const lib = this.constants;
-		if (!lib) return { ok: false, error: '引擎未就绪' };
-		return this.setMode(lib.AnnotationEditorType.HIGHLIGHT);
+		return this.setMode(this.constants?.AnnotationEditorType.INK ?? 15);
 	}
 
 	/** 退出编辑（提交当前会话）。返回 NONE 后，正在绘制的笔画会被落成编辑器。 */
@@ -561,12 +569,18 @@ export class InkEngine {
 	/**
 	 * 下发笔参数。
 	 *
-	 * 参数分流（实测）：
-	 *   · 墨迹笔   —— INK_COLOR(21) / INK_THICKNESS(22) / INK_OPACITY(23)，
-	 *                DrawingEditor.updateDefaultParams 会同时改「默认值」与「当前正在画的笔」；
-	 *   · 荧光笔   —— 默认色必须用 HIGHLIGHT_DEFAULT_COLOR(32)，
-	 *                用 HIGHLIGHT_COLOR(31) 会被静默吞掉（见文件头说明）；
-	 *                厚度用 HIGHLIGHT_THICKNESS(33)。
+	 * 参数分流（0.2.0 起统一走墨迹通道）：
+	 *   · 钢笔   —— INK_COLOR(21) / INK_THICKNESS(22) / INK_OPACITY(23)，
+	 *              DrawingEditor.updateDefaultParams 会同时改「默认值」与「当前正在画的笔」；
+	 *   · 荧光笔 —— 同样走 INK_* 参数：粗笔触 + 半透明（pen.opacity，默认 0.4）。
+	 *              旧版走 HIGHLIGHT_*（32/33/34）因自由高亮自带描边已弃用；
+	 *   · 橡皮   —— 不参与参数下发（它是自建行为，见 ink-erase.ts）。
+	 *
+	 * ⚠️ 顺序敏感：下发前必须先 unselectAll。
+	 * 真机实测（0.1.0 用户反馈）：画完一笔后 pdf.js 会把新生成的编辑器留在
+	 * 选择集里，此时 um.updateParams(INK_COLOR) 会遍历 #selectedEditors 把
+	 * **历史笔迹一起改色**。先清空选择集，updateParams 就只落「默认参数」，
+	 * 只影响下一次落墨。
 	 */
 	applyPen(pen: PenSpec): InkOpResult {
 		const lib = this.constants;
@@ -575,17 +589,17 @@ export class InkEngine {
 
 		const P = lib.AnnotationEditorParamsType;
 		try {
-			if (pen.kind === 'marker') {
-				um.updateParams(P.HIGHLIGHT_DEFAULT_COLOR, pen.color);
-				um.updateParams(P.HIGHLIGHT_THICKNESS, pen.thickness);
-				// 自由高亮：无压感、整笔一色，正是荧光笔的语义
-				um.updateParams(P.HIGHLIGHT_FREE, true);
-			} else if (pen.kind === 'pen') {
+			// 先清掉选择集（刚画完的编辑器往往还在里面），防止历史笔迹被改色
+			try {
+				um.unselectAll?.();
+			} catch {
+				/* 未选中任何东西时忽略 */
+			}
+			if (pen.kind === 'pen' || pen.kind === 'marker') {
 				um.updateParams(P.INK_COLOR, pen.color);
 				um.updateParams(P.INK_THICKNESS, pen.thickness);
 				um.updateParams(P.INK_OPACITY, pen.opacity);
 			}
-			// eraser 不参与参数下发（它是自建行为，见 ink-erase.ts）
 			this.currentPen = pen;
 			return { ok: true };
 		} catch (err) {

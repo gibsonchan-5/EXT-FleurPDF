@@ -1371,6 +1371,17 @@ body.fleur-pdf-mobile .fleur-pdf-ink-switch-btn .svg-icon {
   height: 18px;
 }
 
+/* 图标尺寸自持：不能依赖 Obsidian 全局的 svg.svg-icon 规则 ——
+   移动端 app.css 的版本差异 / 加载时序都可能让该规则缺位，
+   SVG 没有内在尺寸时会在 flex 里被压成一条竖缝（0.1.0 真机「图标几乎不可见」的根因）。
+   因此直接对裸 svg 元素定尺寸，并禁止 flex 收缩。 */
+body.fleur-pdf-mobile .fleur-pdf-ink-switch-btn svg,
+body.fleur-pdf-mobile .fleur-pdf-ink-btn svg {
+  width: 19px;
+  height: 19px;
+  flex: 0 0 auto;
+}
+
 /* ── 笔盒（底部胶囊） ── */
 body.fleur-pdf-mobile .fleur-pdf-ink-bar {
   position: fixed;
@@ -1420,6 +1431,13 @@ body.fleur-pdf-mobile .fleur-pdf-ink-btn.is-primary {
 body.fleur-pdf-mobile .fleur-pdf-ink-btn .svg-icon {
   width: 19px;
   height: 19px;
+}
+
+/* 同上：裸 svg 兜底（见 ink-switch-btn svg 规则处的说明） */
+body.fleur-pdf-mobile .fleur-pdf-ink-pop svg {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
 }
 
 body.fleur-pdf-mobile .fleur-pdf-ink-sep {
@@ -1488,6 +1506,30 @@ body.fleur-pdf-mobile .fleur-pdf-ink-size.is-active {
 body.fleur-pdf-mobile .fleur-pdf-ink-size-dot {
   border-radius: 50%;
   background-color: var(--text-muted);
+}
+
+/* 擦除模式选项（复用 size 按钮的容器，纯文本形态） */
+body.fleur-pdf-mobile .fleur-pdf-ink-mode {
+  width: auto;
+  padding: 0 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+body.fleur-pdf-mobile .fleur-pdf-ink-mode.is-active {
+  color: var(--text-normal);
+}
+
+/* 选区擦除的拖选矩形 */
+body.fleur-pdf-mobile .fleur-pdf-erase-rect {
+  position: fixed;
+  z-index: 1000;
+  display: none;
+  pointer-events: none;
+  border: 1.5px dashed var(--interactive-accent);
+  border-radius: 4px;
+  background-color: color-mix(in srgb, var(--interactive-accent) 8%, transparent);
 }
 
 /* ── 手写模式下的画面调整 ── */

@@ -39,6 +39,21 @@ export interface FleurSettings {
    * 真机移动端（Platform.isMobile）始终启用，不受此项影响。
    */
   mobileDebug: boolean;
+
+  /** 手写笔参数持久化（四支笔的颜色/粗细/不透明度，由 InkUI 维护）。 */
+  inkPens?: Array<{
+    kind: 'pen' | 'marker' | 'eraser' | 'lasso';
+    color: string;
+    thickness: number;
+    opacity: number;
+  }>;
+  /**
+   * 手指滚动（GoodNotes 式防误触，默认开）：手写模式下手指滚动页面、
+   * 只有笔（Apple Pencil 等）落墨。关闭后手指也可以直接书写/擦除。
+   */
+  inkFingerScroll?: boolean;
+  /** 橡皮擦除模式：pixel=像素擦除（切开口保留盘外线段） stroke=笔画擦除 select=选区擦除。 */
+  inkEraserMode?: 'pixel' | 'stroke' | 'select';
 }
 
 export const DEFAULT_SETTINGS: FleurSettings = {
@@ -491,6 +506,33 @@ export class FleurSettingTab extends PluginSettingTab {
           this.plugin.settings.mobileDebug = value;
           await this.plugin.saveSettings();
           this.plugin.applyMobileMode();
+        }));
+
+    // ── 移动端手写批注 ──
+    const inkSection = containerEl.createDiv('fleurpdf-settings-section');
+    new Setting(inkSection).setHeading().setName('移动端手写批注');
+
+    new Setting(inkSection)
+      .setName('手指滚动（防误触）')
+      .setDesc('手写模式下手指滑动只滚动页面，Apple Pencil 等触控笔才落墨。关闭后手指也可以直接书写、擦除。')
+      .addToggle(toggle => toggle
+        .setValue(this.plugin.settings.inkFingerScroll !== false)
+        .onChange(async (value) => {
+          this.plugin.settings.inkFingerScroll = value;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(inkSection)
+      .setName('默认擦除模式')
+      .setDesc('像素擦除：切掉扫过的部分，保留其余线段；笔画擦除：触到哪笔删哪笔；选区擦除：拖一个矩形，相交的笔画整笔删除。')
+      .addDropdown(dropdown => dropdown
+        .addOption('pixel', '像素擦除')
+        .addOption('stroke', '笔画擦除')
+        .addOption('select', '选区擦除')
+        .setValue(this.plugin.settings.inkEraserMode ?? 'stroke')
+        .onChange(async (value) => {
+          this.plugin.settings.inkEraserMode = value as 'pixel' | 'stroke' | 'select';
+          await this.plugin.saveSettings();
         }));
   }
 

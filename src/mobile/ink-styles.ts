@@ -9,8 +9,8 @@
 // 缺了这些样式会怎样（v0.3 实测）：笔迹的 SVG path 数据齐全、但一个像素都看不到 ——
 // SVG 退化为流内元素后被绝对定位的 <canvas> 盖住。这是最难排查的一类「功能不存在」。
 
-import { DRAW_LAYER_CSS, EDITOR_LAYER_CSS, LAYER_BASE_CSS } from './ink-css';
 import { inlineIconUrls } from './ink-icons';
+import { INK_EDITOR_CSS_FLAT } from './ink-css.flat';
 
 const STYLE_ID = 'fleur-pdf-ink-styles';
 
@@ -24,11 +24,14 @@ export function inkStylesInstalled(): boolean {
 /**
  * 注入手写批注所需样式（幂等）。
  *
- * 顺序：基础定位 → 绘制层 → 编辑器层。官方两张表放后面，便于它们覆盖基础规则。
+ * CSS 来源：ink-css.flat.ts（由 scripts/flatten-ink-css.mjs 从 ink-css.ts 生成）——
+ * 全部选择器已平铺、light-dark() 已拆为明暗静态值，兼容旧移动端 WebView
+ * （原生 CSS 嵌套需 Safari 17.2+/Chromium 120+，light-dark() 需 Safari 17.5+/Chromium 123+，
+ * 真机版本不可控，不能赌）。
  */
 export function installInkStyles(): void {
 	if (injected?.isConnected) return;
-	const css = inlineIconUrls(`${LAYER_BASE_CSS}\n${DRAW_LAYER_CSS}\n${EDITOR_LAYER_CSS}`);
+	const css = inlineIconUrls(INK_EDITOR_CSS_FLAT);
 	const el = document.createElement('style');
 	el.id = STYLE_ID;
 	el.textContent = css;
