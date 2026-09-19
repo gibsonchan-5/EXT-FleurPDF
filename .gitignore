@@ -1,0 +1,32 @@
+# Dependency directory
+node_modules/
+
+# Build output
+# NOTE: main.js must be committed — Obsidian community plugins require
+# main.js, manifest.json and styles.css in the repository root.
+*.js.map
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Obsidian plugin data (contains user settings, API keys)
+data.json
+
+# Development files
+test-vault/
+test-doc.md
+debug-*.js
+DEPLOY.md
+STATUS.md

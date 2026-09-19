@@ -1,0 +1,982 @@
+// 侧边栏视图 - HiNote 风格内联批注
+import { ItemView, WorkspaceLeaf, Notice, MarkdownRenderer, TFile } from 'obsidian';
+import type FleurPDFPlugin from './main';
+import type { Annotation, PDFAnnotationData } from './types';
+import { AIService } from './ai-service';
+import { markdownToPlain } from './md-utils';
+import { normalizeWhitespace } from './text-utils';
+import { resolveSystemPrompt } from './ai-prompts';
+import type { SearchResult } from './search';
+
+export const VIEW_TYPE_SIDEBAR = 'fleur-sidebar';
+
+/** Create an SVG element (SVG tags aren't in HTMLElementTagNameMap, so createElementNS is required) */
+function createSvgEl(parent: Node, tag: string, attrs?: Record<string, string>): SVGElement {
+  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  if (attrs) {
+    for (const [k, v] of Object.entries(attrs)) {
+      el.setAttribute(k, v);
+    }
+  }
+  parent.appendChild(el);
+  return el;
+}
+
+/** Helper: create an SVG element with children */
+function appendSvg(
+  container: Node,
+  attrs: Record<string, string>,
+  children: Array<{ tag: string; attrs: Record<string, string> }>
+): SVGElement {
+  const svg = createSvgEl(container, 'svg', attrs);
+  for (const child of children) {
+    createSvgEl(svg, child.tag, child.attrs);
+  }
+  return svg;
+}
+
+const SVG_ATTRS = {
+  width: '14', height: '14',
+  viewBox: '0 0 24 24', fill: 'none',
+  stroke: 'currentColor', 'stroke-width': '2',
+  'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+};
+
+/** 根据背景色亮度挑选可读的前景色（黑/白），用于导出 Markdown 高亮底色下的文字 */
+function pickReadableFg(bg: string): string {
+  const hex = bg.replace('#', '');
+  if (hex.length !== 3 && hex.length !== 6) return '#000';
+  const r = parseInt(hex.length === 3 ? hex[0] + hex[0] : hex.slice(0, 2), 16);
+  const g = parseInt(hex.length === 3 ? hex[1] + hex[1] : hex.slice(2, 4), 16);
+  const b = parseInt(hex.length === 3 ? hex[2] + hex[2] : hex.slice(4, 6), 16);
+  // sRGB 相对亮度阈值 0.6 经验值（黑/白分明）
+  const luma = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luma > 0.6 ? '#000' : '#fff';
+}
+
+export class SidebarView extends ItemView {
+  private data: PDFAnnotationData | null = null;
+  /** 当前正在内联编辑的标注 id */
+  private editingId: string | null = null;
+
+  // ── 全文检索状态 ──
+  private searchQuery = '';
+  private searchResults: SearchResult[] | null = null;
+  /** 结果所属文件路径（切换文件后旧结果作废） */
+  private searchFilePath: string | null = null;
+  private searchSeq = 0;
+  private searchTimer: number | null = null;
+  private searchStatusEl: HTMLElement | null = null;
+  private searchResultsEl: HTMLElement | null = null;
+
+  constructor(leaf: WorkspaceLeaf, private plugin: FleurPDFPlugin) {
+    super(leaf);
+  }
+
+  getViewType() { return VIEW_TYPE_SIDEBAR; }
+  getDisplayText() { return '批注总览'; }
+  getIcon() { return 'list'; }
+
+  async onOpen() { await this.refresh(); }
+
+  async refresh(targetPath?: string | null) {
+    // 保存当前滚动位置（contentEl 或 .view-content 是 Obsidian 的滚动容器）
+    const scrollEl = (this.contentEl?.closest('.view-content') ?? this.contentEl) as HTMLElement | null;
+    const scrollTop = scrollEl?.scrollTop ?? 0;
+
+    // 优先使用传入的路径（右键菜单操作时 PDF 视图可能失去焦点）
+    let file = targetPath
+      ? this.app.vault.getAbstractFileByPath(targetPath)
+      : this.app.workspace.getActiveFile();
+    // getAbstractFileByPath 返回 TAbstractFile，需确认是 TFile
+    if (file && file instanceof TFile && file.extension !== 'pdf') {
+      // 如果不是 PDF，回退到 getActiveFile
+      file = this.app.workspace.getActiveFile();
+    }
+    if (!file || !(file instanceof TFile) || file.extension !== 'pdf') {
+      this.renderEmpty();
+      return;
+    }
+
+    // 文件切换：检索状态与缓存一并作废（缓存被新文件的提取覆盖，这里只中断进行中的提取）
+    if (this.searchFilePath && file.path !== this.searchFilePath) {
+      this.searchQuery = '';
+      this.searchResults = null;
+      this.searchFilePath = null;
+      this.plugin.search.clearCache();
+    }
+
+    this.data = await this.plugin.store.load(file.path);
+    this.render();
+
+    // 恢复滚动位置（新 DOM 渲染后）
+    window.requestAnimationFrame(() => {
+      const newScrollEl = (this.contentEl?.closest('.view-content') ?? this.contentEl) as HTMLElement | null;
+      if (newScrollEl) {
+        newScrollEl.scrollTop = scrollTop;
+      }
+    });
+  }
+
+  // ── 空状态 ──
+
+  private renderEmpty() {
+    const c = this.contentEl;
+    c.empty();
+    c.addClass('fleur-sidebar-content');
+
+    const wrap = c.createDiv();
+    wrap.addClass('fleur-sidebar-empty');
+
+    const icon = wrap.createDiv();
+    icon.addClass('fleur-sidebar-empty-icon');
+    appendSvg(icon,
+      { width: '32', height: '32', viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.5', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' },
+      [
+        { tag: 'path', attrs: { d: 'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z' } },
+        { tag: 'polyline', attrs: { points: '14 2 14 8 20 8' } },
+      ]
+    );
+
+    const txt = wrap.createDiv();
+    txt.addClass('fleur-sidebar-empty-text');
+    txt.textContent = '选中文本后右键开始标注';
+  }
+
+  // ── 主渲染 ──
+
+  private render() {
+    const c = this.contentEl;
+    c.empty();
+    c.addClass('fleur-sidebar-root');
+
+    // 顶栏（即使 0 条批注也渲染——全文检索不依赖批注数据）
+    const header = c.createDiv();
+    header.addClass('fleur-sidebar-header');
+
+    const titleWrap = header.createDiv();
+    titleWrap.addClass('fleur-sidebar-header-title-wrap');
+
+    const title = titleWrap.createDiv({ text: '批注' });
+    title.addClass('fleur-sidebar-header-title');
+
+    const count = titleWrap.createDiv({ text: `${this.data?.annotations.length ?? 0}` });
+    count.addClass('fleur-sidebar-header-count');
+
+    // 导出笔记按钮
+    const exportBtn = header.createEl('button');
+    exportBtn.title = '导出所有批注为笔记';
+    exportBtn.addClass('fleur-sidebar-export-btn');
+    appendSvg(exportBtn, SVG_ATTRS, [
+      { tag: 'path', attrs: { d: 'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z' } },
+      { tag: 'polyline', attrs: { points: '14 2 14 8 20 8' } },
+      { tag: 'line', attrs: { x1: '12', y1: '18', x2: '12', y2: '12' } },
+      { tag: 'polyline', attrs: { points: '9 15 12 18 15 15' } },
+    ]);
+    exportBtn.append(' 导出笔记');
+    exportBtn.addEventListener('click', () => { void this.exportAllNotes(); });
+
+    // 全文检索
+    this.renderSearch(c);
+
+    // 内容区
+    const body = c.createDiv();
+    body.addClass('fleur-sidebar-body');
+
+    if (!this.data || this.data.annotations.length === 0) {
+      // 无批注：给出空提示（检索功能仍可用）
+      const hint = body.createDiv();
+      hint.addClass('fleur-sidebar-empty');
+      const txt = hint.createDiv();
+      txt.addClass('fleur-sidebar-empty-text');
+      txt.textContent = '尚无批注，选中文本后右键开始标注';
+      return;
+    }
+
+    // 按页分组
+    const grouped = new Map<number, Annotation[]>();
+    this.data.annotations.forEach(ann => {
+      if (!grouped.has(ann.page)) grouped.set(ann.page, []);
+      grouped.get(ann.page)!.push(ann);
+    });
+
+    const sortedPages = Array.from(grouped.keys()).sort((a, b) => a - b);
+
+    sortedPages.forEach(pageNum => {
+      const section = body.createDiv();
+      section.addClass('fleur-sidebar-section');
+
+      // 页码标签
+      const pageTag = section.createDiv();
+      pageTag.addClass('fleur-sidebar-page-tag');
+      pageTag.textContent = `p.${pageNum}`;
+
+      this.sortAnnotations(grouped.get(pageNum)!).forEach(ann => {
+        this.renderAnnotation(section, ann);
+      });
+    });
+  }
+
+  // ── 全文检索 ──
+
+  private renderSearch(c: HTMLElement) {
+    const wrap = c.createDiv();
+    wrap.addClass('fleur-search-bar');
+
+    const box = wrap.createDiv();
+    box.addClass('fleur-search-box');
+    appendSvg(box, SVG_ATTRS, [
+      { tag: 'circle', attrs: { cx: '11', cy: '11', r: '8' } },
+      { tag: 'line', attrs: { x1: '21', y1: '21', x2: '16.65', y2: '16.65' } },
+    ]);
+    const input = box.createEl('input');
+    input.type = 'text';
+    input.placeholder = '检索 PDF 全文…';
+    input.value = this.searchQuery;
+    input.addEventListener('input', () => {
+      this.searchQuery = input.value;
+      if (this.searchTimer) window.clearTimeout(this.searchTimer);
+      if (!this.searchQuery.trim()) {
+        this.searchResults = null;
+        // 清空搜索 = 检索动作结束，顺带清除原文定位高亮
+        this.plugin.patcher.clearSearchFlash();
+        this.renderSearchState();
+        return;
+      }
+      this.searchTimer = window.setTimeout(() => void this.runSearch(), 300);
+    });
+
+    const status = wrap.createDiv();
+    status.addClass('fleur-search-status');
+    this.searchStatusEl = status;
+
+    const list = wrap.createDiv();
+    list.addClass('fleur-search-results');
+    this.searchResultsEl = list;
+
+    // 恢复上一次渲染时的检索状态（refresh 会重建整个 DOM）
+    this.renderSearchState();
+  }
+
+  /** 依据当前 searchQuery / searchResults 渲染状态行与结果列表 */
+  private renderSearchState() {
+    if (!this.searchStatusEl || !this.searchResultsEl) return;
+    const status = this.searchStatusEl;
+    const list = this.searchResultsEl;
+    status.empty();
+    list.empty();
+
+    if (!this.searchQuery.trim()) {
+      status.addClass('is-hidden');
+      list.addClass('is-hidden');
+      return;
+    }
+
+    status.removeClass('is-hidden');
+    list.removeClass('is-hidden');
+
+    if (this.searchResults === null) return; // 提取中，状态行已由 runSearch 更新
+
+    if (this.searchResults.length === 0) {
+      status.textContent = '无结果';
+      return;
+    }
+
+    const truncated = this.searchResults.length >= 300;
+    status.textContent = `${this.searchResults.length} 处结果${truncated ? '（已截断）' : ''}`;
+
+    for (let i = 0; i < this.searchResults.length; i++) {
+      const r = this.searchResults[i];
+      const item = list.createDiv();
+      item.addClass('fleur-search-item');
+
+      const meta = item.createDiv();
+      meta.addClass('fleur-search-item-meta');
+      // 展示用全文连续序号（结果已按行文顺序）；跳转定位仍用页内序号 r.occurrence
+      meta.textContent = `第 ${r.pageNum} 页 · 全文第 ${i + 1} 处`;
+
+      const ctx = item.createDiv();
+      ctx.addClass('fleur-search-item-context');
+      // 分段 textContent 高亮关键词，不使用 innerHTML
+      const s = Math.max(0, r.matchStart);
+      const e = Math.min(r.context.length, s + r.matchLength);
+      if (s > 0) ctx.createSpan({ text: r.context.slice(0, s) });
+      const mark = ctx.createSpan({ text: r.context.slice(s, e) });
+      mark.addClass('fleur-search-hit');
+      if (e < r.context.length) ctx.createSpan({ text: r.context.slice(e) });
+
+      item.addEventListener('click', () => {
+        this.plugin.patcher.revealText(r.pageNum, this.searchQuery.trim(), r.occurrence);
+      });
+    }
+  }
+
+  private async runSearch() {
+    const file = this.app.workspace.getActiveFile();
+    const kw = this.searchQuery.trim();
+    if (!file || file.extension !== 'pdf' || !kw) return;
+
+    // 新搜索 = 上一次的定位高亮作废
+    this.plugin.patcher.clearSearchFlash();
+    const seq = ++this.searchSeq;
+    if (this.searchStatusEl) {
+      this.searchStatusEl.removeClass('is-hidden');
+      this.searchStatusEl.textContent = '正在建立索引…';
+    }
+
+    const results = await this.plugin.search.search(file.path, kw, (done, total) => {
+      if (seq === this.searchSeq && this.searchStatusEl) {
+        this.searchStatusEl.textContent = `正在建立索引 ${done} / ${total} 页…`;
+      }
+    });
+
+    // 过期请求（用户已改关键词或已切文件）直接丢弃
+    if (seq !== this.searchSeq) return;
+    this.searchFilePath = file.path;
+    this.searchResults = results ?? [];
+    if (results === null && this.searchStatusEl) {
+      this.searchStatusEl.textContent = '无法读取 PDF 文本';
+    }
+    this.renderSearchState();
+  }
+
+  /**
+   * 同一页内多条批注的排序。
+   * - time（默认）：按创建时间先后
+   * - position：按行文顺序，即文字在页面上的位置，从上到下、从左到右
+   * 缺少位置信息的历史标注会排在最后，并按时间兜底。
+   */
+  private sortAnnotations(list: Annotation[]): Annotation[] {
+    const arr = list.slice();
+    if (this.plugin.settings.annotationSort !== 'position') {
+      return arr.sort((a, b) => a.createdAt - b.createdAt);
+    }
+    // 视作同一行的纵向容差（归一化坐标，约合半行高）
+    const SAME_LINE = 0.01;
+    return arr.sort((a, b) => {
+      const hasA = a.pos ? 0 : 1;
+      const hasB = b.pos ? 0 : 1;
+      if (hasA !== hasB) return hasA - hasB;
+      if (hasA === 1) return a.createdAt - b.createdAt;
+      const pa = a.pos!;
+      const pb = b.pos!;
+      if (Math.abs(pa.top - pb.top) > SAME_LINE) return pa.top - pb.top;
+      return pa.left - pb.left;
+    });
+  }
+
+  // ── 单条标注（HiNote 风格卡片） ──
+
+  private renderAnnotation(parent: HTMLElement, ann: Annotation) {
+    const card = parent.createDiv();
+    card.addClass('fleur-sidebar-card');
+
+    // 顶部色条
+    const bar = card.createDiv();
+    bar.addClass('fleur-sidebar-card-bar');
+    bar.setCssProps({ '--fleur-bar-color': ann.color || (ann.type === 'underline' ? '#E8590C' : '#FFC107') });
+
+    // 主体
+    const main = card.createDiv();
+    main.addClass('fleur-sidebar-card-main');
+
+    // 选中文本行（带悬停操作）
+    const row = main.createDiv();
+    row.addClass('fleur-sidebar-card-row');
+
+    // 类型图标
+    const typeIcon = row.createDiv();
+    typeIcon.addClass('fleur-sidebar-card-type-icon');
+    if (ann.type === 'highlight') {
+      appendSvg(typeIcon, SVG_ATTRS, [
+        { tag: 'path', attrs: { d: 'M12 20h9' } },
+        { tag: 'path', attrs: { d: 'M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z' } },
+      ]);
+    } else if (ann.type === 'underline') {
+      appendSvg(typeIcon, SVG_ATTRS, [
+        { tag: 'path', attrs: { d: 'M6 3v7a6 6 0 0 0 6 6 6 6 0 0 0 6-6V3' } },
+        { tag: 'line', attrs: { x1: '4', y1: '21', x2: '20', y2: '21' } },
+      ]);
+    } else {
+      appendSvg(typeIcon, SVG_ATTRS, [
+        { tag: 'path', attrs: { d: 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z' } },
+      ]);
+    }
+
+    // 选中文本
+    const textWrap = row.createDiv();
+    textWrap.addClass('fleur-sidebar-card-text-wrap');
+
+    const textEl = textWrap.createDiv();
+    textEl.addClass('fleur-sidebar-card-text');
+    textEl.textContent = normalizeWhitespace(ann.text);
+    textEl.setAttribute('title', '点击查看完整内容');
+    textEl.addEventListener('click', () => {
+      textEl.classList.toggle('fleur-text-expanded');
+    });
+
+    // 操作按钮（悬停显示）
+    const actions = row.createDiv();
+    actions.addClass('fleur-sidebar-card-actions');
+
+    // 定位按钮：滚动到原文并高亮该标注
+    const locateBtn = actions.createEl('button');
+    locateBtn.title = '定位到原文';
+    locateBtn.addClass('fleur-sidebar-icon-btn');
+    appendSvg(locateBtn, SVG_ATTRS, [
+      { tag: 'path', attrs: { d: 'M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z' } },
+      { tag: 'circle', attrs: { cx: '12', cy: '10', r: '3' } },
+    ]);
+    locateBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      void this.plugin.patcher.revealAnnotation(ann);
+    });
+
+    // AI 生成批注按钮
+    const aiBtn = actions.createEl('button');
+    aiBtn.title = 'AI 生成批注';
+    aiBtn.addClass('fleur-sidebar-icon-btn');
+    appendSvg(aiBtn, SVG_ATTRS, [
+      { tag: 'path', attrs: { d: 'M12 2a4 4 0 0 1 4 4c0 1.95-1.4 3.58-3.25 3.93L12 22' } },
+      { tag: 'path', attrs: { d: 'M12 2a4 4 0 0 0-4 4c0 1.95 1.4 3.58 3.25 3.93' } },
+      { tag: 'path', attrs: { d: 'M8 6h8' } },
+      { tag: 'path', attrs: { d: 'M9 10h6' } },
+      { tag: 'path', attrs: { d: 'M10 14h4' } },
+      { tag: 'path', attrs: { d: 'M11 18h2' } },
+    ]);
+    aiBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      void this.generateAIComment(ann);
+    });
+
+    // 删除按钮
+    const delBtn = actions.createEl('button');
+    delBtn.title = '删除';
+    delBtn.addClass('fleur-sidebar-icon-btn');
+    delBtn.addClass('danger');
+    appendSvg(delBtn, SVG_ATTRS, [
+      { tag: 'line', attrs: { x1: '18', y1: '6', x2: '6', y2: '18' } },
+      { tag: 'line', attrs: { x1: '6', y1: '6', x2: '18', y2: '18' } },
+    ]);
+    delBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      void this.deleteAnnotation(ann);
+    });
+
+    // 批注区：有内容时显示文本 + 编辑入口；编辑时变为 textarea
+    // ★ 始终显示在文本下方（有批注时），无需点击按钮展开
+    const commentSlot = main.createDiv();
+    commentSlot.dataset['commentSlotFor'] = ann.id;
+
+    if (ann.comment) {
+      this.renderCommentDisplay(commentSlot, ann);
+    } else {
+      // 无批注时，显示一个低调的"添加批注"入口
+      this.renderAddCommentHint(commentSlot, ann);
+    }
+
+    // 时间戳
+    const footer = main.createDiv();
+    footer.addClass('fleur-sidebar-footer');
+    footer.textContent = new Date(ann.createdAt).toLocaleString('zh-CN');
+  }
+
+  /** 显示批注文本 + 编辑/删除小图标（悬停出现） */
+  private renderCommentDisplay(slot: HTMLElement, ann: Annotation) {
+    slot.empty();
+    const wrap = slot.createDiv();
+    wrap.addClass('fleur-sidebar-comment-display');
+
+    const text = wrap.createDiv();
+    text.addClass('fleur-sidebar-comment-text');
+    // 用纯文本显示批注内容（去除 MD 源码）
+    if (ann.comment) {
+      text.textContent = markdownToPlain(normalizeWhitespace(ann.comment));
+    } else {
+      text.textContent = '';
+    }
+
+    // 长批注默认折叠（>120 字符）
+    const plainLen = ann.comment ? markdownToPlain(ann.comment).length : 0;
+    if (plainLen > 120) {
+      text.addClass('is-clamped');
+      const toggle = wrap.createDiv({ text: '展开全文' });
+      toggle.addClass('fleur-comment-toggle');
+      toggle.addEventListener('click', () => {
+        if (text.hasClass('is-clamped')) {
+          text.removeClass('is-clamped');
+          toggle.textContent = '收起';
+        } else {
+          text.addClass('is-clamped');
+          toggle.textContent = '展开全文';
+        }
+      });
+    }
+
+    // 悬停操作（右上角）
+    const ops = wrap.createDiv();
+    ops.addClass('fleur-sidebar-comment-ops');
+
+    const editBtn = ops.createEl('button');
+    editBtn.title = '编辑';
+    editBtn.addClass('fleur-sidebar-comment-ops-btn');
+    appendSvg(editBtn, { ...SVG_ATTRS, width: '12', height: '12' }, [
+      { tag: 'path', attrs: { d: 'M12 20h9' } },
+      { tag: 'path', attrs: { d: 'M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z' } },
+    ]);
+    editBtn.addEventListener('click', () => { void this.openCommentEditor(slot, ann, true); });
+
+    const delCommentBtn = ops.createEl('button');
+    delCommentBtn.title = '删除批注';
+    delCommentBtn.addClass('fleur-sidebar-comment-ops-btn');
+    delCommentBtn.addClass('danger');
+    appendSvg(delCommentBtn, { ...SVG_ATTRS, width: '12', height: '12' }, [
+      { tag: 'polyline', attrs: { points: '3 6 5 6 21 6' } },
+      { tag: 'path', attrs: { d: 'M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2' } },
+    ]);
+    delCommentBtn.addEventListener('click', () => { void (async () => { await this.clearComment(ann); })(); });
+  }
+
+  /** 无批注时显示的小入口（点击展开编辑器） */
+  private renderAddCommentHint(slot: HTMLElement, ann: Annotation) {
+    slot.empty();
+    const hint = slot.createDiv();
+    hint.addClass('fleur-sidebar-add-hint');
+    appendSvg(hint, { ...SVG_ATTRS, width: '12', height: '12' }, [
+      { tag: 'line', attrs: { x1: '12', y1: '5', x2: '12', y2: '19' } },
+      { tag: 'line', attrs: { x1: '5', y1: '12', x2: '19', y2: '12' } },
+    ]);
+    hint.createSpan({ text: '添加批注' });
+    hint.addEventListener('click', () => { void this.openCommentEditor(slot, ann, false); });
+  }
+
+  /** 把批注区切换为 textarea 编辑器 */
+  private async openCommentEditor(slot: HTMLElement, ann: Annotation, isEdit: boolean) {
+    slot.empty();
+    const wrap = slot.createDiv();
+    wrap.addClass('fleur-sidebar-editor-wrap');
+
+    // 如果是编辑 AI 生成的批注，先显示预览，再进入编辑
+    const textarea = wrap.createEl('textarea');
+    textarea.value = ann.comment || '';
+    textarea.placeholder = '写批注…';
+    textarea.addClass('fleur-sidebar-textarea');
+
+    const btnRow = wrap.createDiv();
+    btnRow.addClass('fleur-sidebar-editor-btn-row');
+
+    if (isEdit) {
+      const cancelBtn = btnRow.createEl('button', { text: '取消' });
+      cancelBtn.addClass('fleur-sidebar-editor-btn');
+      cancelBtn.addClass('cancel');
+      cancelBtn.addEventListener('click', () => {
+        this.renderCommentDisplay(slot, ann);
+      });
+
+      // 删除批注按钮
+      const delBtn = btnRow.createEl('button', { text: '删除' });
+      delBtn.addClass('fleur-sidebar-editor-btn');
+      delBtn.addClass('danger');
+      delBtn.addEventListener('click', () => { void (async () => { await this.clearComment(ann); })(); });
+    }
+
+    const saveBtn = btnRow.createEl('button', { text: '保存' });
+    saveBtn.addClass('fleur-sidebar-editor-btn');
+    saveBtn.addClass('save');
+    saveBtn.addEventListener('click', () => { void (async () => {
+      const val = textarea.value.trim();
+      if (!val) { new Notice('批注不能为空'); return; }
+
+      const file = this.app.workspace.getActiveFile();
+      if (!file) return;
+      const data = await this.plugin.store.load(file.path);
+      const target = data.annotations.find(a => a.id === ann.id);
+      if (target) {
+        target.comment = val;
+        await this.plugin.store.save(data);
+
+        // 同步气泡
+        this.plugin.patcher?.removeCommentBubble(ann.id);
+        const anchor = document.querySelector(`[data-ann-id="${ann.id}"]`) as HTMLElement;
+        const pageEl = anchor?.closest('.page') as HTMLElement;
+        if (anchor && pageEl) {
+          this.plugin.patcher?.addCommentBubbleFromSidebar(val, anchor, pageEl, ann.id);
+        }
+      }
+
+      new Notice('已保存');
+      await this.refresh();
+    })(); });
+
+    textarea.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        saveBtn.click();
+      }
+      if (e.key === 'Escape') {
+        if (isEdit) this.renderCommentDisplay(slot, ann);
+        else this.renderAddCommentHint(slot, ann);
+      }
+    });
+
+    window.setTimeout(() => textarea.focus(), 30);
+  }
+
+  /** 删除批注（保留高亮/划线，仅删除 comment 字段） */
+  private async clearComment(ann: Annotation) {
+    const file = this.app.workspace.getActiveFile();
+    if (!file) return;
+    const data = await this.plugin.store.load(file.path);
+    const target = data.annotations.find(a => a.id === ann.id);
+    if (target) {
+      target.comment = undefined;
+      await this.plugin.store.save(data);
+      this.plugin.patcher?.removeCommentBubble(ann.id);
+    }
+    new Notice('已删除批注', 2000);
+    await this.refresh();
+  }
+
+  // ── 内联编辑器（HiNote 风格，不弹 Modal） ──
+
+  private toggleInlineEditor(card: HTMLElement, ann: Annotation) {
+    const editorContainer = card.querySelector(
+      `[data-editor-for="${ann.id}"]`
+    ) as HTMLElement;
+    if (!editorContainer) return;
+
+    // 如果已经展开，收起
+    if (editorContainer.style.display !== 'none') {
+      editorContainer.hide();
+      editorContainer.empty();
+      this.editingId = null;
+      return;
+    }
+
+    // 展开编辑器
+    this.editingId = ann.id;
+    editorContainer.empty();
+    editorContainer.show();
+    editorContainer.addClass('fleur-sidebar-inline-editor');
+
+    const textarea = editorContainer.createEl('textarea');
+    textarea.value = ann.comment || '';
+    textarea.placeholder = '写批注…';
+    textarea.addClass('fleur-sidebar-inline-textarea');
+
+    const btnRow = editorContainer.createDiv();
+    btnRow.addClass('fleur-sidebar-inline-btn-row');
+
+    if (ann.comment) {
+      // 已有批注：显示"清除"和"保存"
+      const clearBtn = btnRow.createEl('button', { text: '清除' });
+      clearBtn.addClass('fleur-sidebar-inline-btn');
+      clearBtn.addClass('clear');
+      clearBtn.addEventListener('click', () => { void (async () => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) return;
+        const data = await this.plugin.store.load(file.path);
+        const target = data.annotations.find(a => a.id === ann.id);
+        if (target) {
+          target.comment = undefined;
+          await this.plugin.store.save(data);
+          this.plugin.patcher?.removeCommentBubble(ann.id);
+        }
+        editorContainer.hide();
+        editorContainer.empty();
+        this.editingId = null;
+        new Notice('已清除批注', 2000);
+        await this.refresh();
+      })(); });
+    }
+
+    const saveBtn = btnRow.createEl('button', { text: '保存' });
+    saveBtn.addClass('fleur-sidebar-inline-btn');
+    saveBtn.addClass('save');
+    saveBtn.addEventListener('click', () => { void (async () => {
+      const val = textarea.value.trim();
+      if (!val) { new Notice('批注不能为空'); return; }
+
+      const file = this.app.workspace.getActiveFile();
+      if (!file) return;
+      const data = await this.plugin.store.load(file.path);
+      const target = data.annotations.find(a => a.id === ann.id);
+      if (target) {
+        target.comment = val;
+        await this.plugin.store.save(data);
+
+        // 同步气泡
+        this.plugin.patcher?.removeCommentBubble(ann.id);
+        const anchor = document.querySelector(`[data-ann-id="${ann.id}"]`) as HTMLElement;
+        const pageEl = anchor?.closest('.page') as HTMLElement;
+        if (anchor && pageEl) {
+          this.plugin.patcher?.addCommentBubbleFromSidebar(val, anchor, pageEl, ann.id);
+        }
+      }
+
+      editorContainer.hide();
+      editorContainer.empty();
+      this.editingId = null;
+      new Notice('已保存');
+      await this.refresh();
+    })(); });
+
+    textarea.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        saveBtn.click();
+      }
+      if (e.key === 'Escape') {
+        editorContainer.hide();
+        editorContainer.empty();
+        this.editingId = null;
+      }
+    });
+
+    window.setTimeout(() => textarea.focus(), 50);
+  }
+
+  // ── AI 生成批注 ──
+
+  private async generateAIComment(ann: Annotation) {
+    const file = this.app.workspace.getActiveFile();
+    if (!file) return;
+
+    // 检查 API Key 是否配置
+    if (!this.plugin.settings.apiKey) {
+      new Notice('请先在设置中配置 AI API Key');
+      return;
+    }
+
+    // 找到侧边栏中对应的评论槽位
+    const commentSlot = this.contentEl.querySelector<HTMLElement>(`[data-comment-slot-for="${ann.id}"]`);
+    if (!commentSlot) return;
+
+    // 显示加载状态
+    commentSlot.empty();
+    const loadingWrap = commentSlot.createDiv();
+    loadingWrap.addClass('fleur-sidebar-ai-loading');
+
+    // 旋转动画
+    const spinner = loadingWrap.createDiv();
+    spinner.addClass('fleur-sidebar-ai-spinner');
+
+    const loadingText = loadingWrap.createDiv({ text: 'AI 正在生成批注…' });
+    loadingText.addClass('fleur-sidebar-ai-loading-text');
+
+    const aiService = new AIService(this.plugin);
+    const fullResponse: string[] = [];
+
+    // 系统提示词：按设置在「提示词模式」里选定的预设取用，自定义模式则用用户填的文本。
+    // 侧边栏是批注场景，需要精炼 → 追加字数约束；原文过长时上限会自动放宽。
+    const systemPrompt = resolveSystemPrompt(
+      this.plugin.settings.promptPreset,
+      this.plugin.settings.customPrompts,
+      {
+        applyLimit: true,
+        sourceTextLength: ann.text.length,
+        baseLimit: this.plugin.settings.annotationLimit,
+      }
+    );
+
+    const messages = [
+      {
+        role: 'system' as const,
+        content: systemPrompt
+      },
+      {
+        role: 'user' as const,
+        content: `请为以下高亮文本生成批注：\n\n「${ann.text}」`
+      }
+    ];
+
+    await aiService.streamChat(
+      messages,
+      (chunk) => {
+        fullResponse.push(chunk);
+        // 实时显示正在生成的内容（纯文本，避免 MD 源码闪烁）
+        const currentText = markdownToPlain(normalizeWhitespace(fullResponse.join('')));
+        loadingText.textContent = currentText;
+        loadingText.addClass('fleur-sidebar-ai-loading-text-streaming');
+      },
+      async () => {
+        // 流式完成
+        const comment = fullResponse.join('').trim();
+        if (!comment) {
+          new Notice('AI 未能生成批注');
+          commentSlot.empty();
+          if (!ann.comment) {
+            this.renderAddCommentHint(commentSlot, ann);
+          } else {
+            this.renderCommentDisplay(commentSlot, ann);
+          }
+          return;
+        }
+
+        // 保存到标注数据
+        const data = await this.plugin.store.load(file.path);
+        const target = data.annotations.find(a => a.id === ann.id);
+        if (target) {
+          target.comment = comment;
+          // 保留原始 type（highlight/underline），恢复逻辑通过 ann.comment 识别气泡
+          await this.plugin.store.save(data);
+
+          // 同步气泡
+          this.plugin.patcher?.removeCommentBubble(ann.id);
+          const anchor = document.querySelector(`[data-ann-id="${ann.id}"]`) as HTMLElement;
+          const pageEl = anchor?.closest('.page') as HTMLElement;
+          if (anchor && pageEl) {
+            this.plugin.patcher?.addCommentBubbleFromSidebar(comment, anchor, pageEl, ann.id);
+          }
+        }
+
+        new Notice('AI 批注已生成');
+        await this.refresh();
+      },
+      (error) => {
+        new Notice(`AI 生成失败：${error}`);
+        commentSlot.empty();
+        if (!ann.comment) {
+          this.renderAddCommentHint(commentSlot, ann);
+        } else {
+          this.renderCommentDisplay(commentSlot, ann);
+        }
+      }
+    );
+  }
+
+  // ── 删除 ─
+
+  private async deleteAnnotation(ann: Annotation) {
+    const file = this.app.workspace.getActiveFile();
+    if (!file) return;
+    // 先使在途/排队的恢复失效（同步执行，抢在任何 await 之前），
+    // 防止删除期间正在等待 textLayer 的恢复流程把已删标注画回原文
+    this.plugin.patcher?.invalidateRestoreState();
+    const data = await this.plugin.store.load(file.path);
+    data.annotations = data.annotations.filter(a => a.id !== ann.id);
+    await this.plugin.store.save(data);
+    this.clearAnnotationStyles(ann);
+    this.plugin.patcher?.removeCommentBubble(ann.id);
+    // 兜底清扫：该页上不属于任何剩余标注的气泡一并移除
+    this.plugin.patcher?.sweepBubblesForPage(ann.page, new Set(data.annotations.map(a => a.id)));
+    new Notice('已删除', 2000);
+    await this.refresh();
+  }
+
+  // ── 导出所有批注为笔记 ──
+
+  private async exportAllNotes() {
+    const file = this.app.workspace.getActiveFile();
+    if (!file) {
+      new Notice('请先打开一个 PDF 文件');
+      return;
+    }
+    if (!this.data || this.data.annotations.length === 0) {
+      new Notice('当前文件没有批注可导出');
+      return;
+    }
+
+    const noteName = `${file.basename} - 批注笔记`;
+    const folder = this.plugin.settings.noteFolder?.trim() || '';
+    const notePath = folder ? `${folder}/${noteName}.md` : `${noteName}.md`;
+
+    try {
+      // 确保文件夹存在
+      if (folder) {
+        const folderExists = await this.app.vault.adapter.exists(folder);
+        if (!folderExists) {
+          await this.app.vault.createFolder(folder);
+        }
+      }
+
+      // 文件已存在时自动覆盖
+      const fileExists = await this.app.vault.adapter.exists(notePath);
+      if (fileExists) {
+        const existingFile = this.app.vault.getAbstractFileByPath(notePath);
+        if (existingFile) {
+          await this.app.vault.trash(existingFile, false);
+        }
+      }
+
+      let md = `> 导出时间：${new Date().toLocaleString('zh-CN')}\n\n`;
+
+      const grouped = new Map<number, Annotation[]>();
+      this.data.annotations.forEach(ann => {
+        if (!grouped.has(ann.page)) grouped.set(ann.page, []);
+        grouped.get(ann.page)!.push(ann);
+      });
+
+      const sortedPages = Array.from(grouped.keys()).sort((a, b) => a - b);
+
+      sortedPages.forEach(pageNum => {
+        md += `## 第 ${pageNum} 页\n\n`;
+        this.sortAnnotations(grouped.get(pageNum)!).forEach(ann => {
+          // ann.text / ann.comment 在写入存储时已 normalizeWhitespace 收敛为单行；
+          // 此处再兜底 normalize 一次以兼容历史数据（避免 ==...== 跨段被切断）。
+          const annText = normalizeWhitespace(ann.text);
+          const annComment = ann.comment ? normalizeWhitespace(ann.comment) : '';
+          if (ann.type === 'highlight') {
+            // 高亮：保留 PDF 中的具体底色（默认用 settings.highlightColors[0]）
+            const hlColor = ann.color || '#FFC107';
+            const fg = pickReadableFg(hlColor);
+            md += `<span style="background-color:${hlColor};color:${fg};padding:0 2px;border-radius:2px">${annText}</span>\n\n`;
+          } else if (ann.type === 'underline') {
+            // 划线：保留 PDF 中的具体下划线颜色，wavy 用波浪线
+            const ulColor = ann.color || '#E8590C';
+            const style = ann.underlineStyle === 'wavy' ? 'wavy' : 'solid';
+            md += `<span style="text-decoration:underline;text-decoration-color:${ulColor};text-decoration-style:${style}">${annText}</span>\n\n`;
+          } else {
+            md += `<span style="color:var(--text-muted)">${annText}</span>\n\n`;
+          }
+          if (annComment) {
+            md += `> ${annComment}\n\n`;
+          }
+          md += `---\n\n`;
+        });
+      });
+
+      await this.app.vault.create(notePath, md);
+      new Notice('笔记已导出');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      new Notice(`导出失败：${msg}`);
+    }
+  }
+
+  // ── 清除样式 ──
+
+  private clearAnnotationStyles(ann: Annotation) {
+    // 清除必须与渲染对称：渲染端除了内联样式还加了 class（fleur-underline-wavy 等）
+    // 和 CSS 变量（--fleur-underline-color），只置空内联样式压不住 class 规则，
+    // 会导致删除后波浪线/下划线残留到下次重渲染。
+    const clear = (el: HTMLElement) => {
+      // fleur-search-flash 也要摘：定位/检索的高亮是 class 绘制的（带 !important），
+      // 「先定位后删除」时残留该 class 会让片段继续涂色（小片段表现为像素点）
+      el.removeClass('fleur-highlight', 'fleur-underline', 'fleur-underline-wavy', 'fleur-underline-solid', 'fleur-search-flash');
+      el.setCssStyles({ background: '', borderRadius: '', textDecoration: '', textUnderlineOffset: '' });
+      el.setCssProps({ '--fleur-underline-color': '' });
+      delete el.dataset['annId'];
+    };
+
+    const matched = document.querySelectorAll(`[data-ann-id="${ann.id}"]`);
+    matched.forEach((span) => clear(span as HTMLElement));
+
+    if (matched.length === 0) {
+      const pages = document.querySelectorAll(`.page[data-page-number="${ann.page}"]`);
+      pages.forEach(page => {
+        const textLayer = page.querySelector('.textLayer');
+        if (!textLayer) return;
+        textLayer.querySelectorAll('span').forEach(span => {
+          if (span.textContent?.trim() === ann.text.trim()) {
+            clear(span as HTMLElement);
+          }
+        });
+      });
+    }
+
+    // 闪灼状态同步：刚被清掉样式的片段不再属于定位高亮
+    this.plugin.patcher?.pruneFlashSpans();
+  }
+}
+
