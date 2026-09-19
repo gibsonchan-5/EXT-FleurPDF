@@ -967,6 +967,27 @@ export class InkEngine {
 		}
 	}
 
+	/**
+	 * handle 指向的 PDF 视图是否仍挂在文档上（未被销毁）。
+	 *
+	 * 这是「关闭文件 / 切换标签页」时的关键判断。Obsidian 销毁 PDF 视图后，
+	 * `this.handle` 仍指向那个旧对象：它的 annotationStorage 里可能还留着条目
+	 * （于是 hasUnsaved 依然为真），但 `saveDocument` 已随视图一同失效 ——
+	 * 此时继续导出只会拿到空字节。
+	 *
+	 * 真机 0.4.1 的误报「手写批注保存失败：没有可写回的手写批注」就出在这里：
+	 * 关闭文件触发的兜底落盘，拿着一个已经销毁的 handle 去导出。
+	 */
+	get isHandleAlive(): boolean {
+		const root = this.handle?.viewer?.viewer as HTMLElement | undefined;
+		if (!root) return false;
+		try {
+			return root.isConnected;
+		} catch {
+			return false;
+		}
+	}
+
 	/* ------------------------------ 辅助 ------------------------------ */
 
 	/** 页面 DOM 元素（坐标换算用）。 */

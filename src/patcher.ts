@@ -102,15 +102,22 @@ function iconCopy(c: Node) {
     { tag: 'path', attrs: { d: 'M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1' } },
   ]);
 }
+/** 划线图标：描边用「用户的划线颜色」。该颜色是为与画到正文上的线保持一致而设的
+ *  （默认 #6B0000 深红），但在深色主题下会融进背景，看上去像「图标没显示」——
+ *  加一个 class 让 CSS 补浅色衬底，保住颜色语义的同时确保任何主题下都看得见。 */
 function iconUnderlineSolid(c: Node, color: string) {
-  return svgIcon(c, color, [
+  const svg = svgIcon(c, color, [
     { tag: 'line', attrs: { x1: '3', y1: '18', x2: '21', y2: '18' } },
   ]);
+  svg.classList.add('fleur-context-ul');
+  return svg;
 }
 function iconUnderlineWavy(c: Node, color: string) {
-  return svgIcon(c, color, [
+  const svg = svgIcon(c, color, [
     { tag: 'path', attrs: { d: 'M3 18 Q6 12, 9 18 T15 18 T21 18' } },
   ]);
+  svg.classList.add('fleur-context-ul');
+  return svg;
 }
 function iconComment(c: Node) {
   return svgIcon(c, 'currentColor', [
@@ -150,10 +157,23 @@ export class PDFPatcher {
   private boundMouseDown: ((e: MouseEvent) => void) | null = null;
   private boundMouseUp: ((e: MouseEvent) => void) | null = null;
   private boundKeyDown: ((e: KeyboardEvent) => void) | null = null;
-  /** 移动端：选中文字后自动唤出批注菜单（桌面端走右键，不挂这两个监听）。 */
+  /** 移动端：选中文字后自动唤出批注菜单（桌面端走右键，不挂这些监听）。 */
   private boundSelectionChange: (() => void) | null = null;
   private boundTouchEndForMenu: (() => void) | null = null;
+  private boundTouchStartForMenu: (() => void) | null = null;
   private selectionMenuTimer: number | null = null;
+  /**
+   * 手指是否还按在屏幕上。
+   *
+   * 触摸屏拖选择手柄调整选区时，WebView 会连续派发 selectionchange，且**中途常有
+   * 300ms 以上的停顿**（手指压着不动、或系统在做手柄吸附）。单靠时间去抖挡不住：
+   * 一停就弹，用户还没选完菜单就冒出来，再拖一下又弹一次 —— 真机 0.4.1 反馈的
+   * 「选中文本的过程中弹了多次菜单」正是这个。
+   *
+   * 用户要的语义是明确的：「选完了再弹」。所以只要手指还在屏上就一律不弹，
+   * 抬手后再走一次正常的稳定判定。
+   */
+  private touchSelecting = false;
   /** 最近一次自动弹出的选区指纹 —— 同一选区不重复弹。 */
   private lastAutoMenuKey = '';
   /** 当前打开的浮动面板（同一时刻只允许一个，选区连续变化时会重建）。 */
@@ -214,8 +234,20 @@ export class PDFPatcher {
     // 桌面端保持右键语义，不挂这两个监听。
     if (isMobileUI(this.plugin)) {
       this.boundSelectionChange = () => this.onSelectionChange();
-      this.boundTouchEndForMenu = () => this.onSelectionChange();
+      // 手指按下期间禁止弹菜单（见 touchSelecting 的说明），抬手后再判定
+      this.boundTouchStartForMenu = () => {
+        this.touchSelecting = true;
+      };
+      this.boundTouchEndForMenu = () => {
+        // 延迟一拍再放开：WebView 往往在 touchend 之后才把最终选区提交到 DOM，
+        // 立刻判定会读到拖动中途的旧选区（菜单落点偏高、偏歪，且随后还会再弹一次）。
+        window.setTimeout(() => {
+          this.touchSelecting = false;
+          this.onSelectionChange();
+        }, 260);
+      };
       document.addEventListener('selectionchange', this.boundSelectionChange);
+      document.addEventListener('touchstart', this.boundTouchStartForMenu, true);
       document.addEventListener('touchend', this.boundTouchEndForMenu, true);
     }
 
@@ -859,10 +891,12 @@ export class PDFPatcher {
    */
   private onSelectionChange(): void {
     if (this.selectionMenuTimer !== null) window.clearTimeout(this.selectionMenuTimer);
+    // 500ms（原 300ms）：手柄吸附、双指微调选区都会带来短暂停顿，
+    // 300ms 不足以把它们与「用户选完了」区分开。与 touchSelecting 形成双重保险。
     this.selectionMenuTimer = window.setTimeout(() => {
       this.selectionMenuTimer = null;
       this.syncMobileMenuWithSelection();
-    }, 300);
+    }, 500);
   }
 
   /**
@@ -874,6 +908,9 @@ export class PDFPatcher {
    * 「选区早没了、面板还杵在那」的僵尸面板。
    */
   private syncMobileMenuWithSelection(): void {
+    // 手指还按在屏上 → 选区尚未定稿，一律不弹（用户拖手柄时菜单绝不出现）
+    if (this.touchSelecting) return;
+
     // 手写模式下 textLayer 已禁选：既不再弹，也要把可能在切换前留下的面板收掉
     if (document.body.classList.contains('fleur-pdf-ink-active')) {
       this.hideContextMenu();
@@ -1017,13 +1054,27 @@ export class PDFPatcher {
       const hlBtn = hlGroup.createEl('button');
       hlBtn.addClass('fleur-context-item', 'fleur-context-hl');
       hlBtn.title = `高亮 ${idx + 1}`;
-      const dot = hlBtn.createDiv({ cls: 'fleur-context-hl-dot' });
-      // 尺寸走行内样式，不依赖插件 styles.css。
-      // 依据：移动端 WebView 里样式表的加载时序与优先级都不可靠，靠 CSS 给宽高的
-      // 元素会渲染成 0×0 —— SVG 图标当初整片看不见就是这个原因，而它后来之所以好了，
-      // 正是因为 svgIcon 把 width/height 写成了元素自身的属性。
-      // 三个颜色圆点走的仍是 CSS 尺寸，于是成了「图标有了、颜色没了」的那半边。
-      dot.setCssStyles({ background: color, width: '20px', height: '20px', borderRadius: '50%' });
+      const dot = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      // ↑ 用 SVG 圆点，而不是「div + 行内背景色」。
+      //
+      // 这是踩过两次的同一道坎：移动端 WebView 下，div 的尺寸与背景最终都由样式表
+      // 决定，一旦用户主题对 button/div 有更高优先级的规则（或样式表时序异常），
+      // 圆点就渲染成一个不可见的空盒子 —— 真机反馈的「图标有了、颜色没了」。
+      // 而 SVG 的 fill / width / height 是**元素自身的属性**，样式表只能叠加，
+      // 不能让它「没有颜色、没有尺寸」。菜单里其余图标之所以一直好好的，
+      // 正因为它们本来就是 SVG；现在圆点与它们同源。
+      dot.setAttribute('class', 'fleur-context-hl-dot');
+      dot.setAttribute('width', '20');
+      dot.setAttribute('height', '20');
+      dot.setAttribute('viewBox', '0 0 20 20');
+      dot.setAttribute('aria-hidden', 'true');
+      const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      circle.setAttribute('cx', '10');
+      circle.setAttribute('cy', '10');
+      circle.setAttribute('r', '9');
+      circle.setAttribute('fill', color);
+      dot.appendChild(circle);
+      hlBtn.appendChild(dot);
       hlBtn.addEventListener('click', () => {
         void this.applyHighlight(text, pageNum, pages, color, 'highlight', filePath, endPage);
         close();
@@ -2107,10 +2158,15 @@ export class PDFPatcher {
       document.removeEventListener('selectionchange', this.boundSelectionChange);
       this.boundSelectionChange = null;
     }
+    if (this.boundTouchStartForMenu) {
+      document.removeEventListener('touchstart', this.boundTouchStartForMenu, true);
+      this.boundTouchStartForMenu = null;
+    }
     if (this.boundTouchEndForMenu) {
       document.removeEventListener('touchend', this.boundTouchEndForMenu, true);
       this.boundTouchEndForMenu = null;
     }
+    this.touchSelecting = false;
     if (this.selectionMenuTimer !== null) {
       window.clearTimeout(this.selectionMenuTimer);
       this.selectionMenuTimer = null;

@@ -1067,18 +1067,32 @@
   gap: 3px;
 }
 
-.fleur-context-hl-dot {
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  border: 2px solid var(--background-modifier-border-hover);
-  transition: transform 0.12s ease, border-color 0.12s ease;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+/* 高亮颜色圆点 —— 元素是 SVG（见 patcher.ts）。
+   颜色来自 <circle fill="…">，尺寸同时给 CSS 与 svg 属性，任一层失效都还看得见。
+   选择器必须比 `.fleur-context-item svg`（0,1,1）更具体，否则会被描边图标的
+   16px 抢走尺寸 —— 那会让圆点缩成米粒大小，看起来仍像「没有颜色图标」。 */
+.fleur-context-item svg.fleur-context-hl-dot {
+  width: 20px;
+  height: 20px;
+  display: block;
+  flex: 0 0 auto;
+  transition: transform 0.12s ease;
 }
 
 .fleur-context-hl:hover .fleur-context-hl-dot {
-  transform: scale(1.1);
-  border-color: var(--text-muted);
+  transform: scale(1.12);
+}
+
+/* 划线图标（直线 / 波浪）的描边用的是用户的划线颜色，默认 #6B0000。
+   深色主题下这个深红几乎融进背景 —— 真机上看起来就是「图标没显示」。
+   补一层同形状的浅色衬底（drop-shadow 跟着 stroke 走），
+   既保住「这个颜色就是会画上去的颜色」这层信息，又保证任何主题下都看得清。 */
+.theme-dark .fleur-context-item svg.fleur-context-ul {
+  filter: drop-shadow(0 0 1.4px rgba(255, 255, 255, 0.65));
+}
+
+.theme-light .fleur-context-item svg.fleur-context-ul {
+  filter: drop-shadow(0 0 1px rgba(0, 0, 0, 0.2));
 }
 
 .fleur-sidebar-textarea {
@@ -1374,6 +1388,46 @@ body.fleur-pdf-mobile .fleur-pdf-ink-switch-btn.is-active {
 body.fleur-pdf-mobile .fleur-pdf-ink-switch-btn .svg-icon {
   width: 18px;
   height: 18px;
+}
+
+/* ── 悬浮胶囊：拖动中 / 收起成贴边把手 ──
+   拖动中抬层级 + 加深投影，给一个「抓住了」的反馈；
+   收起后只留一根半透明贴边把手 —— 不挡正文，但随时点得回来。
+   （长按 650ms 收起，点把手恢复；命令面板也有同名开关兜底。） */
+body.fleur-pdf-mobile .fleur-pdf-ink-toggle.is-dragging {
+  z-index: 40;
+  opacity: 0.92;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+}
+
+body.fleur-pdf-mobile .fleur-pdf-ink-toggle.is-collapsed {
+  padding: 0;
+  gap: 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+body.fleur-pdf-mobile .fleur-pdf-ink-toggle.is-collapsed .fleur-pdf-ink-switch-btn {
+  display: none;
+}
+
+/* 把手本体：14×46 的圆角竖条，常态半透明，按住时变实 */
+body.fleur-pdf-mobile .fleur-pdf-ink-toggle.is-collapsed::after {
+  content: '';
+  display: block;
+  width: 14px;
+  height: 46px;
+  border-radius: 999px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.14);
+  opacity: 0.55;
+  transition: opacity 120ms ease;
+}
+
+body.fleur-pdf-mobile .fleur-pdf-ink-toggle.is-collapsed:active::after {
+  opacity: 1;
 }
 
 /* 图标尺寸自持：不能依赖 Obsidian 全局的 svg.svg-icon 规则 ——
@@ -1705,11 +1759,55 @@ body.fleur-pdf-mobile .fleur-context-group {
   gap: 5px;
 }
 
-body.fleur-pdf-mobile .fleur-context-hl-dot {
-  width: 22px;
-  height: 22px;
+body.fleur-pdf-mobile .fleur-context-item svg.fleur-context-hl-dot {
+  width: 24px;
+  height: 24px;
 }
 
 body.fleur-pdf-mobile .fleur-context-sep {
   margin: 0 3px;
+}
+
+/* ══════════ 侧边栏批注卡片：触摸设备上的操作按钮 ══════════
+   桌面端用 hover 显隐操作按钮（见 `.fleur-sidebar-card:hover .fleur-sidebar-card-actions`）。
+   触摸屏**没有 hover**，于是 opacity: 0 永远生效 —— 真机反馈的「侧边栏里定位、
+   AI 生成、删除三个图标都没有」根因就在这里，与图标渲染毫无关系，是桌面交互
+   直接搬到触摸设备导致的。
+   Obsidian 移动端会给 body 加 `is-mobile`，插件自己的标记是 `fleur-pdf-mobile`，
+   两者都覆盖（桌面端开「移动端调试」时同样受益）。 */
+body.is-mobile .fleur-sidebar-card-actions,
+body.fleur-pdf-mobile .fleur-sidebar-card-actions {
+  opacity: 1;
+  transition: none;
+}
+
+/* 触摸目标放大到 34px（原 22px，低于可点区域的下限，手指很难点中）；
+   同时把图标色从 text-faint 提到 text-muted，在移动端屏幕上更易辨认。 */
+body.is-mobile .fleur-sidebar-icon-btn,
+body.fleur-pdf-mobile .fleur-sidebar-icon-btn {
+  width: 34px;
+  height: 34px;
+  padding: 6px;
+  color: var(--text-muted);
+}
+
+/* 图标尺寸必须由 CSS 显式给出。
+   Obsidian 的 app.css 里存在针对 svg 的全局规则，而 SVG 的 width/height **属性**
+   优先级低于任何 CSS 规则 —— 只靠属性给尺寸的元素会被抢走。
+   这正是「文本菜单的图标可见、侧边栏的图标不可见」的真正分野：菜单那条有
+   `.fleur-context-item svg` 规则保护，侧边栏这条此前没有。 */
+.fleur-sidebar-icon-btn svg,
+.fleur-sidebar-card-type svg {
+  display: block;
+  flex: 0 0 auto;
+}
+
+.fleur-sidebar-icon-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.fleur-sidebar-card-type svg {
+  width: 14px;
+  height: 14px;
 }

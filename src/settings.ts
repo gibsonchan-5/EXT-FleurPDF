@@ -54,6 +54,16 @@ export interface FleurSettings {
   inkFingerScroll?: boolean;
   /** 橡皮擦除模式：pixel=像素擦除（切开口保留盘外线段） stroke=笔画擦除 select=选区擦除。 */
   inkEraserMode?: 'pixel' | 'stroke' | 'select';
+  /**
+   * 悬浮切换器（编辑 / 手写 / 批注 三态胶囊）的位置与形态。
+   *
+   * 拖动后吸附到左或右边；y 存的是**视口比例**（0~1）而不是像素 ——
+   * 换设备、转屏、改分辨率后像素值会跑到屏幕外，比例不会。
+   * collapsed = 收成贴边小把手（用户嫌它挡内容时的出路，点把手即可恢复）。
+   */
+  inkSwitcherSide?: 'left' | 'right';
+  inkSwitcherY?: number;
+  inkSwitcherCollapsed?: boolean;
 }
 
 export const DEFAULT_SETTINGS: FleurSettings = {

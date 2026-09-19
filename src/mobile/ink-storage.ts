@@ -21,6 +21,14 @@ export const INK_BACKUP_KEEP = 5;
 export interface SaveOutcome {
 	ok: boolean;
 	error?: string;
+	/**
+	 * 未写盘的原因。
+	 * `empty` = 没有可写回的内容（视图已销毁、或本来就还没落墨）—— 属正常情况，
+	 * 调用方**不应**把它当失败弹提示。真机 0.4.1 那条「保存失败：没有可写回的手写
+	 * 批注」的误报，正是因为这条正常路径被当成错误报了出来。
+	 * `error` = 真的写入失败（IO / 文件被占用等）。
+	 */
+	reason?: 'empty' | 'error';
 	/** 本次备份的路径（失败为空）。 */
 	backupPath?: string;
 	/** 写回的字节数。 */
@@ -113,7 +121,9 @@ export class InkStorage {
 	async saveAnnotated(engine: InkEngine, file: TFile): Promise<SaveOutcome> {
 		const bytes = await engine.exportAnnotatedBytes();
 		if (!bytes || bytes.length === 0) {
-			return { ok: false, error: '没有可写回的手写批注' };
+			// 「导不出内容」不是失败：多数场合是视图已被销毁（关闭文件 / 切标签页），
+			// 此时既没东西可写、也不该惊动用户。用 reason 把它与真 IO 错误区分开。
+			return { ok: false, reason: 'empty', error: '没有可写回的手写批注' };
 		}
 
 		// 先备份：备份失败仍允许继续（但会把这一情况告诉调用方）。
@@ -124,6 +134,7 @@ export class InkStorage {
 		} catch (err) {
 			return {
 				ok: false,
+				reason: 'error',
 				backupPath: backupPath ?? undefined,
 				error: err instanceof Error ? err.message : String(err),
 			};

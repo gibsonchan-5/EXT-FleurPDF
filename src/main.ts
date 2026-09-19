@@ -65,6 +65,20 @@ export default class FleurPDFPlugin extends Plugin {
       callback: () => { void this.activateSidebar(); }
     });
 
+    // 悬浮胶囊被长按收起后，必须留一条「用命令就能找回来」的路：
+    // 否则用户一旦收起来，就只能靠再点那个已经变得很不起眼的把手。
+    this.addCommand({
+      id: 'toggle-ink-switcher',
+      name: '显示 / 收起手写批注悬浮按钮',
+      callback: () => {
+        if (!this.inkUI) {
+          new Notice('当前未启用移动端批注界面');
+          return;
+        }
+        this.inkUI.toggleSwitcher();
+      }
+    });
+
     this.addCommand({
       id: 'restore-annotations',
       name: '重新渲染当前 PDF 的标注',

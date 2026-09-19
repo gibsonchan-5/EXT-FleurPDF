@@ -72,7 +72,15 @@ const SIZE_RANGE: Record<PenSpec['kind'], [number, number, number]> = {
  * 对几十 MB 的 PDF 是百毫秒级的活；太短会反复重写，太长则「关掉 App 时」
  * 丢的内容多。12 秒是「一笔一停手就看得到结果」与「不折腾磁盘」的折中。
  */
-const AUTO_SAVE_IDLE_MS = 12000;
+/**
+ * 停笔后多久静默落盘一次。
+ *
+ * 从 12s 收紧到 4s：12s 太长，「写完一笔立刻关文件」的用户根本等不到，
+ * 而关闭时的兜底落盘一旦赶在视图销毁之后就注定失败（真机 0.4.1 的误报就出在这里）。
+ * 4s 是「用户极少在 4 秒内完成落笔→关闭」与「不频繁重写 PDF」之间的折中；
+ * 写盘本身有互斥 + 防抖，连续落笔不会叠加写盘次数。
+ */
+const AUTO_SAVE_IDLE_MS = 4000;
 
 /** 擦除模式的展示名。 */
 const ERASE_MODE_LABEL: Record<EraseMode, string> = {
@@ -200,10 +208,28 @@ export class InkUI {
 			if (!this.active) void this.enterInk();
 		});
 
+		// 第三段：批注列表（原「双态」扩为三态）。
+		// 真机反馈「右侧边栏的批注窗口很难呼出」—— 此前只有 ribbon 图标与命令面板
+		// 两个入口，而移动端 ribbon 要展开左侧栏才看得见，等于没有入口。
+		// 挂到这颗常驻胶囊上，与手写/编辑同处一地，不进设置面板也能打开。
+		const sideBtn = sw.createDiv('fleur-pdf-ink-switch-btn');
+		setIcon(sideBtn, 'list');
+		sideBtn.setAttribute('aria-label', '批注列表');
+		sideBtn.addEventListener('click', (e) => {
+			e.preventDefault();
+			e.stopPropagation();
+			void this.plugin.activateSidebar();
+		});
+
 		this.editSeg = editBtn;
 		this.inkSeg = inkBtn;
 		this.toggleBtn = sw;
 		this.syncSwitcher();
+
+		// 位置恢复（上次拖到哪就回到哪）+ 拖动换位 + 长按收起
+		this.applySwitcherPos();
+		sw.toggleClass('is-collapsed', this.plugin.settings.inkSwitcherCollapsed === true);
+		this.attachSwitcherDrag(sw);
 
 		document.body.addEventListener('click', this.onBodyClick, true);
 
@@ -234,10 +260,150 @@ export class InkUI {
 		}
 	}
 
-	/** 同步双态切换器的高亮（编辑段 / 手写段互斥）。 */
+	/** 同步切换器的高亮（编辑段 / 手写段互斥）。 */
 	private syncSwitcher(): void {
 		this.editSeg?.toggleClass('is-active', !this.active);
 		this.inkSeg?.toggleClass('is-active', this.active);
+	}
+
+	/* ==================== 悬浮切换器：拖动 / 收起 ==================== */
+
+	/**
+	 * 把胶囊放到设置里记住的位置。
+	 *
+	 * y 存的是**视口比例**而不是像素：换设备、转屏、改分辨率后像素值会落到屏幕外，
+	 * 比例不会。`translateY(-50%)` 让 top 百分比落在胶囊中心而不是顶边。
+	 */
+	private applySwitcherPos(): void {
+		const sw = this.toggleBtn;
+		if (!sw) return;
+		const side = this.plugin.settings.inkSwitcherSide ?? 'right';
+		const y = Math.min(1, Math.max(0, this.plugin.settings.inkSwitcherY ?? 0.78));
+		sw.setCssStyles({
+			left: side === 'left' ? '12px' : 'auto',
+			right: side === 'right' ? '12px' : 'auto',
+			top: `${Math.round(y * 100)}%`,
+			bottom: 'auto',
+			transform: 'translateY(-50%)',
+		});
+	}
+
+	/**
+	 * 拖动换位 + 长按收起。
+	 *
+	 * 三段按钮仍是点击语义，所以必须把「拖动」与「点击」分开：位移小于 6px 一律当点击
+	 * （交给按钮自己的 click），超过才进入拖动。拖动结束后再用一次捕获态 click 把紧随其后的
+	 * 误点吞掉 —— 否则松手会顺手触发按钮动作（例如误入手写模式）。
+	 */
+	private attachSwitcherDrag(sw: HTMLElement): void {
+		let dragging = false;
+		let moved = false;
+		let startX = 0;
+		let startY = 0;
+		let originLeft = 0;
+		let originTop = 0;
+		let longPress: number | null = null;
+
+		const clearLongPress = () => {
+			if (longPress !== null) {
+				window.clearTimeout(longPress);
+				longPress = null;
+			}
+		};
+
+		sw.addEventListener('pointerdown', (e) => {
+			if (e.pointerType === 'mouse' && e.button !== 0) return;
+			dragging = true;
+			moved = false;
+			startX = e.clientX;
+			startY = e.clientY;
+			const r = sw.getBoundingClientRect();
+			originLeft = r.left;
+			originTop = r.top;
+			// 立刻换算成「绝对定位 + 无 transform」的等价表述：拖动时位移才是线性的，
+			// 否则 translateY(-50%) 与 top 会互相打架，胶囊会跳。
+			sw.setCssStyles({
+				left: `${originLeft}px`,
+				right: 'auto',
+				top: `${originTop}px`,
+				bottom: 'auto',
+				transform: 'none',
+			});
+			clearLongPress();
+			// 长按 650ms = 收起（短于它都当点击，避免误收）
+			longPress = window.setTimeout(() => {
+				longPress = null;
+				if (moved) return;
+				dragging = false;
+				this.setSwitcherCollapsed(true);
+			}, 650);
+		}, true);
+
+		sw.addEventListener('pointermove', (e) => {
+			if (!dragging) return;
+			const dx = e.clientX - startX;
+			const dy = e.clientY - startY;
+			if (!moved) {
+				if (Math.hypot(dx, dy) < 6) return;
+				moved = true;
+				clearLongPress();
+				sw.addClass('is-dragging');
+			}
+			sw.setCssStyles({ left: `${originLeft + dx}px`, top: `${originTop + dy}px` });
+		});
+
+		const finish = () => {
+			if (!dragging) return;
+			dragging = false;
+			clearLongPress();
+			if (!moved) {
+				// 只点没拖：把 pointerdown 里改过的定位还原回去
+				sw.removeClass('is-dragging');
+				this.applySwitcherPos();
+				return;
+			}
+			sw.removeClass('is-dragging');
+			// 吞掉紧随其后的一次 click（拖动松手不应触发按钮动作）
+			sw.addEventListener('click', (ev) => {
+				ev.stopPropagation();
+				ev.preventDefault();
+			}, { capture: true, once: true });
+
+			// 吸附到最近的边；垂直位置夹在可视区内，避免被安全区/顶栏切掉
+			const r = sw.getBoundingClientRect();
+			const side: 'left' | 'right' = r.left + r.width / 2 < window.innerWidth / 2 ? 'left' : 'right';
+			const half = r.height / 2;
+			const centerY = Math.min(window.innerHeight - half - 8, Math.max(half + 8, r.top + r.height / 2));
+			this.plugin.settings.inkSwitcherSide = side;
+			this.plugin.settings.inkSwitcherY = centerY / window.innerHeight;
+			void this.plugin.saveSettings().catch(() => undefined);
+			this.applySwitcherPos();
+		};
+		sw.addEventListener('pointerup', finish);
+		sw.addEventListener('pointercancel', finish);
+
+		// 收起态下点一下把手即恢复（那时没有按钮可点，click 落在容器自己身上）
+		sw.addEventListener('click', (e) => {
+			if (this.plugin.settings.inkSwitcherCollapsed !== true) return;
+			e.preventDefault();
+			e.stopPropagation();
+			this.setSwitcherCollapsed(false);
+		}, true);
+	}
+
+	/** 收起 / 展开悬浮胶囊，状态持久化。 */
+	private setSwitcherCollapsed(collapsed: boolean): void {
+		this.plugin.settings.inkSwitcherCollapsed = collapsed;
+		void this.plugin.saveSettings().catch(() => undefined);
+		this.toggleBtn?.toggleClass('is-collapsed', collapsed);
+		if (collapsed) {
+			new Notice('悬浮按钮已收起：点侧边的小把手即可恢复，也可用命令面板的「显示/收起手写批注悬浮按钮」');
+		}
+	}
+
+	/** 供命令面板调用：显示 / 收起悬浮胶囊（用户彻底找不到入口时的兜底）。 */
+	toggleSwitcher(): void {
+		this.setSwitcherCollapsed(this.plugin.settings.inkSwitcherCollapsed !== true);
 	}
 
 	unmount(): void {
@@ -371,6 +537,15 @@ export class InkUI {
 		}
 		this.saving = true;
 		try {
+			// 视图已被销毁（关闭文件 / 切标签页）→ 没有可写回的目标了。
+			// 此时必须静默复位：真机 0.4.1 的误报「手写批注保存失败：没有可写回的
+			// 手写批注」就是拿已销毁的 handle 继续导出造成的。顺带把 active 复位，
+			// 否则后续每次 file-open / layout-change 都会再撞一次同样的墙。
+			if (!this.engine.isHandleAlive) {
+				this.resetInkStateIfDead();
+				return false;
+			}
+
 			// 提交当前绘制会话，否则最后一笔还不在存储里
 			this.engine.commit();
 			// commit() 是同步接口，但落进 AnnotationStorage 要等一拍（见 ink-engine 陷阱 4）
@@ -391,8 +566,12 @@ export class InkUI {
 				if (!silent) new Notice(`已写入手写批注（${Math.round((out.bytes ?? 0) / 1024)} KB）`);
 				return true;
 			}
-			// 失败必须让用户知道 —— 静默失败会直接变成「批注又没了」。
-			// 但自动保存的失败多半是「视图正在切换途中已被销毁」这类一次性的，
+			// 没有内容可写回 = 正常路径（视图刚被销毁、或本来就还没落墨），不提示。
+			// 这条曾经是「关闭文件后弹一堆保存失败」的元凶：正常情况被当成错误报了。
+			if (out.reason === 'empty') return false;
+
+			// 真失败（IO / 文件被占用）必须让用户知道 —— 静默失败会变成「批注又没了」。
+			// 但自动保存的失败多半是「视图正在切换途中」这类一次性的，
 			// 每次都弹会变成噪音，所以每个会话只提示一次。
 			if (!silent || !this.saveErrorNotified) {
 				this.saveErrorNotified = true;
@@ -402,6 +581,28 @@ export class InkUI {
 		} finally {
 			this.saving = false;
 		}
+	}
+
+	/**
+	 * PDF 视图已被销毁时的状态复位。
+	 *
+	 * 关闭文件不会走 exitInk（用户没点「完成」），于是 active 一直留在 true、
+	 * engine 也还攥着旧 handle。复位后悬浮切换器回到「编辑」态、笔盒收起，
+	 * 后续的 file-open / layout-change 不会再拿幽灵 handle 去做无意义的导出。
+	 */
+	private resetInkStateIfDead(): void {
+		if (!this.active) return;
+		this.cancelAutoSave();
+		this.clearLasso();
+		this.clearEraseRect();
+		this.active = false;
+		document.body.removeClass('fleur-pdf-ink-active');
+		this.syncSwitcher();
+		this.detachPenInput();
+		this.detachGestureShield();
+		this.detachTouchRouter();
+		this.penBar?.remove();
+		this.penBar = null;
 	}
 
 	/** 安排一次空闲落盘（每次改动后调用，重复调用只保留最后一次）。 */
