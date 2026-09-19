@@ -249,6 +249,16 @@ export class InkUI {
 			}),
 		);
 
+		// ── 切后台 / 页面卸载前的兜底落盘 ──
+		// 「写完直接杀掉 App」在移动端是高频操作。杀进程前一般会先切后台
+		// （iOS 上滑 / Android Home 键），visibilitychange → hidden 是最后一班
+		// 可靠的车；pagehide 再兜一层（部分 WebView 只派发它）。
+		this.onHiddenFlush = () => {
+			if (this.active) void this.autoSave(true);
+		};
+		document.addEventListener('visibilitychange', this.onHiddenFlush);
+		window.addEventListener('pagehide', this.onHiddenFlush);
+
 		// M3-A：首次挂载给一条指引入口在哪（只在本会话第一次出现）。
 		// 带上版本号：真机排查时「到底装没装上这一版」是最先要确认的事，
 		// 之前就吃过 BRAT 未更新却在排查已修问题的亏。
@@ -329,6 +339,14 @@ export class InkUI {
 				bottom: 'auto',
 				transform: 'none',
 			});
+			// 捕获指针：手指滑出胶囊边界后 move 事件仍派发到这里。
+			// 没有它，触摸拖动只要偏出元素几像素就收不到 move（触摸的隐式捕获
+			// 只在浏览器不接管手势时存在，而真机手指面积大、极易滑出）。
+			try {
+				(sw as HTMLElement).setPointerCapture(e.pointerId);
+			} catch {
+				/* 某些 WebView 对已释放指针抛错，忽略 */
+			}
 			clearLongPress();
 			// 长按 650ms = 收起（短于它都当点击，避免误收）
 			longPress = window.setTimeout(() => {
@@ -341,6 +359,9 @@ export class InkUI {
 
 		sw.addEventListener('pointermove', (e) => {
 			if (!dragging) return;
+			// 触摸拖动期间阻止浏览器把这套手势再解释成滚动/缩放（双保险，
+			// 第一道是 CSS touch-action: none）
+			if (e.pointerType !== 'mouse') e.preventDefault();
 			const dx = e.clientX - startX;
 			const dy = e.clientY - startY;
 			if (!moved) {
@@ -352,9 +373,14 @@ export class InkUI {
 			sw.setCssStyles({ left: `${originLeft + dx}px`, top: `${originTop + dy}px` });
 		});
 
-		const finish = () => {
+		const finish = (e: PointerEvent) => {
 			if (!dragging) return;
 			dragging = false;
+			try {
+				(sw as HTMLElement).releasePointerCapture?.(e.pointerId);
+			} catch {
+				/* 忽略 */
+			}
 			clearLongPress();
 			if (!moved) {
 				// 只点没拖：把 pointerdown 里改过的定位还原回去
@@ -379,8 +405,8 @@ export class InkUI {
 			void this.plugin.saveSettings().catch(() => undefined);
 			this.applySwitcherPos();
 		};
-		sw.addEventListener('pointerup', finish);
-		sw.addEventListener('pointercancel', finish);
+		sw.addEventListener('pointerup', (e) => finish(e as PointerEvent));
+		sw.addEventListener('pointercancel', (e) => finish(e as PointerEvent));
 
 		// 收起态下点一下把手即恢复（那时没有按钮可点，click 落在容器自己身上）
 		sw.addEventListener('click', (e) => {
@@ -408,6 +434,8 @@ export class InkUI {
 
 	unmount(): void {
 		document.body.removeEventListener('click', this.onBodyClick, true);
+		document.removeEventListener('visibilitychange', this.onHiddenFlush);
+		window.removeEventListener('pagehide', this.onHiddenFlush);
 		// 卸载前尽力落盘（异步发起，不阻塞卸载流程）
 		if (this.active) void this.exitInk();
 		this.cancelAutoSave();
@@ -425,6 +453,9 @@ export class InkUI {
 		if (t.closest('.fleur-pdf-ink-bar')) return;
 		this.penBar?.findAll('.fleur-pdf-ink-pop').forEach((el) => el.removeClass('is-open'));
 	};
+
+	/** 切后台 / 页面卸载前的兜底落盘（见 mount 里的 visibilitychange 注册）。 */
+	private onHiddenFlush: () => void = () => undefined;
 
 	/* ============================ 模式切换 ============================ */
 
@@ -472,6 +503,73 @@ export class InkUI {
 			new Notice('手写已开启，但当前 PDF 视图的批注接口不可用：可书写，笔色 / 橡皮 / 撤销暂不可用');
 		} else {
 			this.umMissing = false;
+			// 固有笔迹播种：重开文件后，写回过的笔迹是文件里的 /Ink 注释，
+			// 正常应由 pdf.js 在进入编辑模式时转成编辑器（真机 0.4.2 实测这条
+			// 转换在移动端没有生效 —— 表现为历史笔迹擦不掉、套索圈不中）。
+			// 这里主动补建，只补缺失的，pdf.js 已转成功的会被去重跳过。
+			window.setTimeout(() => {
+				if (this.active) void this.seedExistingInkEditors();
+			}, 450);
+		}
+	}
+
+	/**
+	 * 把文件固有的手写笔迹补建为编辑器（擦除 / 套索 / 移动都以编辑器为操作对象）。
+	 *
+	 * 复用 pdf.js 自己的转换链路：注释层 getEditableAnnotations() →
+	 * 编辑器层 deserialize()（内部就是 InkEditor.deserialize 对 InkAnnotationElement
+	 * 的那条路，与 enable() 的原生转换一字不差）。任何一页失败都不影响其余页。
+	 */
+	private async seedExistingInkEditors(): Promise<void> {
+		try {
+			const um = this.engine.getUIManager();
+			if (!um) return;
+			let seeded = 0;
+			for (let pi = 0; pi < this.engine.pageCount; pi++) {
+				const editorLayer = this.engine.getLayer(pi);
+				const annLayer = this.engine.getAnnotationLayer(pi);
+				if (!editorLayer || !annLayer?.getEditableAnnotations) continue;
+
+				// 去重：pdf.js 原生转换已建过的编辑器带 annotationElementId，
+				// 与固有注释的 data.id 一一对应，出现即说明该注释已可编辑。
+				const have = new Set(
+					this.engine
+						.getEditors(pi)
+						.map((e: any) => e?.annotationElementId)
+						.filter(Boolean),
+				);
+
+				for (const el of annLayer.getEditableAnnotations()) {
+					const data = el?.data;
+					if (!data || data.subtype !== 'Ink' || !data.id) continue;
+					if (have.has(data.id)) continue;
+					let editor: any = null;
+					try {
+						// 编辑器层公开方法，内部即 InkEditor.deserialize(el, layer, um)
+						editor = await (editorLayer as any).deserialize(el);
+					} catch {
+						continue;
+					}
+					if (!editor) continue;
+					try {
+						(editorLayer as any).add(editor);
+						editor.enableEditing?.();
+						seeded++;
+					} catch {
+						try {
+							um.addEditor(editor);
+							seeded++;
+						} catch {
+							/* 单个失败不影响其余 */
+						}
+					}
+				}
+			}
+			if (seeded > 0) {
+				console.log(`[FleurPDF Ink] 固有手写笔迹已补建为可编辑对象：${seeded} 条`);
+			}
+		} catch (err) {
+			console.warn('[FleurPDF Ink] 固有笔迹播种失败（不影响书写）:', err);
 		}
 	}
 
@@ -564,6 +662,10 @@ export class InkUI {
 			const out = await this.storage.saveAnnotated(this.engine, file);
 			if (out.ok) {
 				if (!silent) new Notice(`已写入手写批注（${Math.round((out.bytes ?? 0) / 1024)} KB）`);
+				// 写回改动了 vault 里的文件，Obsidian 可能随即重载 PDF 视图（旧 handle
+				// 被销毁）。若不重连，用户继续画的每一笔都落在死 handle 上 —— 重开
+				// 文件时全部丢失，只剩这一次写回的内容（真机 0.4.2 的「只存开头几笔」）。
+				void this.reattachIfReloaded();
 				return true;
 			}
 			// 没有内容可写回 = 正常路径（视图刚被销毁、或本来就还没落墨），不提示。
@@ -590,6 +692,38 @@ export class InkUI {
 	 * engine 也还攥着旧 handle。复位后悬浮切换器回到「编辑」态、笔盒收起，
 	 * 后续的 file-open / layout-change 不会再拿幽灵 handle 去做无意义的导出。
 	 */
+	/**
+	 * 视图被 Obsidian 重载后的「热重连」。
+	 *
+	 * 背景：autoSave 写回 PDF 后，Obsidian 检测到文件变化可能销毁并重建 PDF 视图。
+	 * 此时 engine 的 handle 指向死对象 —— 用户的手指还在屏幕上，但输入路由、
+	 * 笔盒都挂在旧 DOM 上，之后画的每一笔都不会进入新文档。
+	 *
+	 * 处理：按 enterInk 的同一条路径重新 resolve → 进编辑模式 → 重挂输入。
+	 * handle 还活着（Obsidian 没重载）时什么都不做，零开销。
+	 */
+	private async reattachIfReloaded(): Promise<void> {
+		if (!this.active) return;
+		if (this.engine.isHandleAlive) return;
+
+		// 旧 DOM 的绑定全部摘掉（旧节点已不在文档上，留着只是泄漏）
+		this.detachPenInput();
+		this.detachGestureShield();
+		this.detachTouchRouter();
+		this.penBar?.remove();
+		this.penBar = null;
+		this.clearLasso();
+		this.clearEraseRect();
+		try {
+			await this.engine.exit();
+		} catch {
+			/* 旧 handle 已死，exit 只是形式 */
+		}
+
+		await this.enterInk();
+		if (this.active) new Notice('手写批注已保存');
+	}
+
 	private resetInkStateIfDead(): void {
 		if (!this.active) return;
 		this.cancelAutoSave();
@@ -1300,6 +1434,7 @@ export class InkUI {
 		const hits = lassoHitEditors(this.engine, pageNumber - 1, poly);
 		if (!hits.length) {
 			this.clearLassoSelectionOnly();
+			new Notice('圈内没有笔迹（本页的笔迹须已在手写模式下加载）');
 			return;
 		}
 		const r = this.engine.selectMany(hits);

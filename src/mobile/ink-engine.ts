@@ -464,6 +464,24 @@ export class InkEngine {
 		}
 	}
 
+	/** 文档总页数（无 handle 时 0）。 */
+	get pageCount(): number {
+		return (this.handle?.viewer?._pages ?? []).length;
+	}
+
+	/**
+	 * 指定页的 AnnotationLayer 实例（「注释层」，注意不是编辑器层）。
+	 *
+	 * 编辑器层（AnnotationEditorLayer）与注释层（AnnotationLayer）是两个东西：
+	 * 编辑器层负责「画 / 改」，注释层负责「渲染文件里固有的注释」。
+	 * 固有手写笔迹要转成可编辑对象，数据源头就在注释层的
+	 * getEditableAnnotations() —— 与 pdf.js 自身 enable() 里用的同一入口。
+	 */
+	getAnnotationLayer(pageIndex = 0): any {
+		const pv = (this.handle?.viewer?._pages ?? [])[pageIndex];
+		return pv?.annotationLayer?.annotationLayer ?? null;
+	}
+
 	/**
 	 * 该页的编辑器列表。
 	 *

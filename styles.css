@@ -1362,7 +1362,11 @@ body.fleur-pdf-mobile .fleur-pdf-ink-toggle {
   background: var(--background-secondary);
   border: 1px solid var(--background-modifier-border);
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
-  touch-action: manipulation;
+  /* ⚠️ 必须是 none，不能是 manipulation：
+     manipulation 仍允许浏览器做平移手势 —— 手指按住胶囊一拖，
+     WebView 判定为滚动并接管（pointercancel），拖动立刻中断，
+     真机表现就是「拖拽基本不可用，只能挪动两三像素」。 */
+  touch-action: none;
 }
 
 body.fleur-pdf-mobile .fleur-pdf-ink-switch-btn {
@@ -1727,14 +1731,13 @@ body.fleur-pdf-mobile .fleur-pdf-ink-eraser-pop .fleur-pdf-ink-modes {
    桌面端 28px 的按钮在平板上点不准（真机反馈）；移动端整体放大到 40px 命中区，
    并给容器加横向滚动兜住小屏（按钮变多时不会溢出屏幕）。 */
 body.fleur-pdf-mobile .fleur-context-panel {
-  /* max-width 约束的是内容盒：缺 box-sizing 时还要再叠加 16px padding 与 2px 边框。
+  /* max-width 约束的是内容盒：缺 box-sizing 时还要再叠加 padding 与边框。
      实测（Playwright 复现 412px 视口）：面板总宽 414px、scrollWidth 449 > clientWidth 412，
-     即面板比屏幕还宽 —— 右侧按钮被切在屏幕外，且整个面板横向可拖。
-     这不是「按钮不见了」，是它们被推到了视野之外。 */
+     即面板比屏幕还宽 —— 右侧按钮被切在屏幕外，且整个面板横向可拖。 */
   box-sizing: border-box;
-  gap: 5px;
-  padding: 8px;
-  border-radius: 12px;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 10px;
   max-width: calc(100vw - 16px);
   overflow-x: auto;
   overflow-y: hidden;
@@ -1743,29 +1746,32 @@ body.fleur-pdf-mobile .fleur-context-panel {
   touch-action: pan-x;
 }
 
+/* 0.4.1 曾把触摸目标放到 40px，真机反馈「菜单太大」—— 现在收到 32px：
+   仍高于触屏 44px 指南的单指舒适区下限之上可接受的范围，
+   换来整条菜单收窄约 1/4，不挡正文。 */
 body.fleur-pdf-mobile .fleur-context-item {
-  width: 40px;
-  height: 40px;
+  width: 32px;
+  height: 32px;
   flex: 0 0 auto;
-  border-radius: 8px;
+  border-radius: 7px;
 }
 
 body.fleur-pdf-mobile .fleur-context-item svg {
-  width: 20px;
-  height: 20px;
+  width: 15px;
+  height: 15px;
 }
 
 body.fleur-pdf-mobile .fleur-context-group {
-  gap: 5px;
+  gap: 2px;
 }
 
 body.fleur-pdf-mobile .fleur-context-item svg.fleur-context-hl-dot {
-  width: 24px;
-  height: 24px;
+  width: 18px;
+  height: 18px;
 }
 
 body.fleur-pdf-mobile .fleur-context-sep {
-  margin: 0 3px;
+  margin: 0 2px;
 }
 
 /* ══════════ 侧边栏批注卡片：触摸设备上的操作按钮 ══════════
