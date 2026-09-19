@@ -78,9 +78,13 @@ canvas.draw {
   background: transparent;
 }
 
-/* 选中态 */
+/* 选中态 —— 不画外框。
+   真机（小米平板 0.3.0）：手写时 pdf.js 会把刚画完的编辑器留在选择集里，
+   outline: 1px solid Highlight 会让每一笔都带上系统高亮色描边；
+   几笔相邻时用户看到的就是「一整片选区框把几笔串起来」。
+   用户明确要求手写时不得出现选区框（要框选请用套索工具），故不设描边。 */
 .selectedEditor {
-  outline: 1px solid Highlight;
+  outline: none;
 }
 
 /* 荧光笔模式（body.fleur-pdf-ink-marker 由 InkUI 在选中荧光笔时同步）：
@@ -1640,6 +1644,36 @@ export const EDITOR_LAYER_CSS = `
       gap: 16px;
     }
   }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   手写笔迹：不显示任何「选中框 / 缩放手柄」
+   ───────────────────────────────────────────────────────────────────────
+   真机（小米平板 0.3.0）实测：pdf.js 在 INK 模式下画完一笔会把编辑器留在
+   选择集里（unselectAll() 在编辑模式下不清选择集 —— 见 ink-engine.ts
+   clearSelection 的注释），于是每一笔都带一圈 Highlight 描边；
+   相邻几笔连起来看就是「一整片选区框把几笔串起来」。
+
+   用户明确要求：手写时不要出现任何选区框，要框选请用套索工具。
+   套索的选择虚线框由 ink-lasso.ts 自绘，不受此处影响。
+
+   放在本表最末：平铺后与官方 .annotationEditorLayer :is(.inkEditor, …)
+   特异性相同（0,2,0），靠「后出现者胜出」压掉官方的 border / ::before 描边，
+   另用 !important 兜住 .resizers 手柄的 display。
+   ═══════════════════════════════════════════════════════════════════════ */
+.annotationEditorLayer .inkEditor,
+.annotationEditorLayer .inkEditor.selectedEditor {
+  border: none !important;
+  outline: none !important;
+}
+
+.annotationEditorLayer .inkEditor::before,
+.annotationEditorLayer .inkEditor.selectedEditor::before {
+  content: none !important;
+}
+
+.annotationEditorLayer .inkEditor > .resizers {
+  display: none !important;
 }
 `;
 

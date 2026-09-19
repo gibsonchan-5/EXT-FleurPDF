@@ -12,6 +12,7 @@ import type { Annotation } from './types';
 import { AIChatPanel } from './ai-chat-modal';
 import { markdownToPlain } from './md-utils';
 import { normalizeWhitespace } from './text-utils';
+import { isMobileUI } from './platform';
 
 type UnderlineStyle = 'solid' | 'wavy';
 
@@ -149,6 +150,14 @@ export class PDFPatcher {
   private boundMouseDown: ((e: MouseEvent) => void) | null = null;
   private boundMouseUp: ((e: MouseEvent) => void) | null = null;
   private boundKeyDown: ((e: KeyboardEvent) => void) | null = null;
+  /** 移动端：选中文字后自动唤出批注菜单（桌面端走右键，不挂这两个监听）。 */
+  private boundSelectionChange: (() => void) | null = null;
+  private boundTouchEndForMenu: (() => void) | null = null;
+  private selectionMenuTimer: number | null = null;
+  /** 最近一次自动弹出的选区指纹 —— 同一选区不重复弹。 */
+  private lastAutoMenuKey = '';
+  /** 当前打开的浮动面板（同一时刻只允许一个，选区连续变化时会重建）。 */
+  private openPanel: HTMLElement | null = null;
   private commentBubbles: CommentBubble[] = [];
   private lastSnapshot: SelectionSnapshot | null = null;
   /** 快照有效期：活选区被清空后，右键仍可用最近一次选区 */
@@ -191,6 +200,18 @@ export class PDFPatcher {
     document.addEventListener('mousedown', this.boundMouseDown, true);
     document.addEventListener('mouseup', this.boundMouseUp, true);
     document.addEventListener('keydown', this.boundKeyDown, true);
+
+    // 移动端：长按选字会被 WebView 的原生文本选择接管，`contextmenu` 不派发，
+    // 于是批注菜单永远不出现（真机 0.3.0 反馈：选中了文字，但没有任何菜单）。
+    // 改用 `selectionchange` 驱动 —— 选区稳定后自动弹出，与手势类型无关；
+    // `touchend` 再兜一层（部分 WebView 在拖选择手柄期间不连续派发 selectionchange）。
+    // 桌面端保持右键语义，不挂这两个监听。
+    if (isMobileUI(this.plugin)) {
+      this.boundSelectionChange = () => this.onSelectionChange();
+      this.boundTouchEndForMenu = () => this.onSelectionChange();
+      document.addEventListener('selectionchange', this.boundSelectionChange);
+      document.addEventListener('touchend', this.boundTouchEndForMenu, true);
+    }
 
     // 监听 file-open（文件切换时触发）
     this.plugin.registerEvent(
@@ -815,6 +836,69 @@ export class PDFPatcher {
     }
   }
 
+  /* ════════════════════════════════════════════
+     移动端：选中文字 → 自动弹出批注菜单
+     ════════════════════════════════════════════ */
+
+  /**
+   * 选区变化 → 去抖后尝试弹出批注菜单（仅移动端注册）。
+   *
+   * 桌面端靠 `contextmenu`（右键）唤出面板；移动端长按选字会被 WebView 的原生
+   * 文本选择接管，`contextmenu` 不会派发 —— 真机表现就是「选中了文字，但批注菜单
+   * 永远不出现」（0.3.0 小米平板反馈）。这里换成「选区稳定 320ms 后自动弹」，
+   * 与手势类型无关。
+   *
+   * 去抖是必须的：拖动选择手柄期间 `selectionchange` 会连续触发，
+   * 一有选区就弹面板会挡住手柄，用户没法继续调整选区。
+   */
+  private onSelectionChange(): void {
+    if (this.selectionMenuTimer !== null) window.clearTimeout(this.selectionMenuTimer);
+    this.selectionMenuTimer = window.setTimeout(() => {
+      this.selectionMenuTimer = null;
+      this.maybeShowMobileMenu();
+    }, 320);
+  }
+
+  /** 选区稳定后：校验选区确实落在 PDF 文本框里，然后就地弹出批注面板。 */
+  private maybeShowMobileMenu(): void {
+    // 手写模式下 textLayer 已禁选，这里再兜一层，避免残留选区误弹
+    if (document.body.classList.contains('fleur-pdf-ink-active')) return;
+    if (!this.currentPagePath) return;
+
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
+
+    const text = selection.toString().trim();
+    if (!text) return;
+
+    // 焦点在输入框 / 我们自己的面板里 → 不弹（批注编辑中、AI 提问中）
+    const active = document.activeElement as HTMLElement | null;
+    if (active?.closest?.('input, textarea, .fleur-context-panel, .modal-container')) return;
+
+    const range = selection.getRangeAt(0);
+    const anchorNode = range.commonAncestorContainer;
+    const anchor = (anchorNode.nodeType === Node.ELEMENT_NODE
+      ? anchorNode
+      : anchorNode.parentElement) as HTMLElement | null;
+    if (!anchor || !this.isInPDFView(anchor)) return;
+
+    // 同一段选区不重复弹（selectionchange 可能因无关原因再次触发）
+    const key = `${ text.length }|${ text.slice(0, 48) }`;
+    if (key === this.lastAutoMenuKey) return;
+
+    const snapshot = this.buildSnapshotFromSelection(selection);
+    if (!snapshot?.text) return;
+
+    this.lastAutoMenuKey = key;
+    const rect = range.getBoundingClientRect();
+    void this.showContextMenu(
+      Math.min(Math.max(8, rect.left + rect.width / 2), Math.max(8, window.innerWidth - 8)),
+      rect.bottom + 10,
+      snapshot,
+      [],
+    );
+  }
+
   /** 根据页码查找页面元素 */
   private findPageByNumber(pageNum: number): HTMLElement | null {
     const pages = document.querySelectorAll('.page');
@@ -953,15 +1037,17 @@ export class PDFPatcher {
       }
     }
 
-    // 点击外部关闭面板
-    const closeHandler = (e: MouseEvent) => {
-      if (!panel.contains(e.target as Node)) {
-        panel.remove();
-        document.removeEventListener('mousedown', closeHandler, true);
-      }
+    // 点击外部关闭面板。
+    // 用 pointerdown 而不是 mousedown：移动端触摸只派发 pointer/touch 事件，
+    // mousedown 在部分 WebView 里要等 300ms 才合成，面板会「点外面关不掉」。
+    const closeHandler = (e: Event) => {
+      if (panel.contains(e.target as Node)) return;
+      panel.remove();
+      document.removeEventListener('pointerdown', closeHandler, true);
+      if (this.openPanel === panel) this.openPanel = null;
     };
     window.setTimeout(() => {
-      document.addEventListener('mousedown', closeHandler, true);
+      document.addEventListener('pointerdown', closeHandler, true);
     }, 0);
 
     // 定位面板（确保不超出视口）
@@ -1946,6 +2032,20 @@ export class PDFPatcher {
       document.removeEventListener('keydown', this.boundKeyDown, true);
       this.boundKeyDown = null;
     }
+    if (this.boundSelectionChange) {
+      document.removeEventListener('selectionchange', this.boundSelectionChange);
+      this.boundSelectionChange = null;
+    }
+    if (this.boundTouchEndForMenu) {
+      document.removeEventListener('touchend', this.boundTouchEndForMenu, true);
+      this.boundTouchEndForMenu = null;
+    }
+    if (this.selectionMenuTimer !== null) {
+      window.clearTimeout(this.selectionMenuTimer);
+      this.selectionMenuTimer = null;
+    }
+    this.openPanel?.remove();
+    this.openPanel = null;
     this.stopPdfViewerWatcher();
     this.commentBubbles.forEach(b => b.el.remove());
     this.commentBubbles = [];

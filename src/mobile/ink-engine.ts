@@ -693,6 +693,25 @@ export class InkEngine {
 	}
 
 	/**
+	 * 落笔结束后主动「提交 + 释放选择集」。
+	 *
+	 * 为什么需要：pdf.js 在 INK 模式下每画一笔都会把新编辑器放进 `#selectedEditors`，
+	 * 而 `unselectAll()` 在 mode !== NONE 时**不清选择集**（见 clearSelection 注释）。
+	 * 结果就是「刚画的笔一直处于选中态」：
+	 *   · 视觉上每一笔带一圈高亮描边，相邻几笔像被一个选区框串起来（真机反馈）；
+	 *   · 行为上后续任何 `updateParams` 都可能顺着选择集改到历史笔迹。
+	 *
+	 * 每次 pointerup 后调用它，让「笔迹始终未选中」成为常态。
+	 * 需要真正选择时走套索模式（ink-lasso 自己维护选择集，不经 pdf.js 选择）。
+	 */
+	releaseSelection(): void {
+		const um = this.getUIManager();
+		if (!um) return;
+		this.commit();
+		this.clearSelection(um);
+	}
+
+	/**
 	 * 多选：套索圈中若干编辑器后整组入选。
 	 *
 	 * toggleSelected 是「追加/反选」语义，不触碰选择集里的其他成员，

@@ -32,24 +32,38 @@ const SCROLL_SELECTOR = '.pdf-viewer-container, .pdfViewer';
 /**
  * 首版四笔。钢笔与荧光笔同走墨迹通道（0.2.0 起，荧光笔 = 大笔触 + 半透明，
  * 不再走 pdf.js 自由高亮 —— 那条通道的 Outline 多边形渲染自带一圈描边）。
- * 荧光笔的半透明感来自 opacity 0.4（GoodNotes 同款视觉）。
+ * 荧光笔的半透明感来自 opacity 0.45（0.3.0 从 0.4 上调：真机反馈颜色太淡）。
  */
 export const DEFAULT_PENS: PenSpec[] = [
 	{ kind: 'pen', color: '#1f1f1f', thickness: 3, opacity: 1 },
-	{ kind: 'marker', color: '#ffe066', thickness: 14, opacity: 0.4 },
+	{ kind: 'marker', color: '#f2c200', thickness: 14, opacity: 0.45 },
 	{ kind: 'eraser', color: '', thickness: 16, opacity: 1 },
 	{ kind: 'lasso', color: '', thickness: 12, opacity: 1 },
 ];
 
 /** 钢笔可选色（沿用 fleur-pdf 已有的标注配色基调：深金 / 深蓝 / 深红）。 */
 const PEN_COLORS = ['#1f1f1f', '#D4A017', '#2979C4', '#D32F2F', '#2E7D32'];
-/** 荧光笔可选色。 */
-const MARKER_COLORS = ['#ffe066', '#a5f3b0', '#9fd8ff', '#ffb3c8', '#e0c3ff'];
-/** 粗细档位（PDF 用户空间单位）。 */
-const PEN_SIZES = [2, 3, 5, 8];
-const MARKER_SIZES = [10, 14, 20, 28];
-/** 橡皮大小档位（命中半径，PDF 用户空间单位）。 */
-const ERASER_SIZES = [8, 12, 20, 32];
+/**
+ * 荧光笔可选色。
+ *
+ * 0.3.0 小米平板反馈：上一组（#ffe066 / #a5f3b0 / #9fd8ff / #ffb3c8 / #e0c3ff）
+ * 配 opacity 0.4 在浅色正文上几乎看不出颜色。这里整体加深一档 ——
+ * 仍然保持「能透出下面文字」的荧光笔语义，但颜色要真正立得住。
+ */
+const MARKER_COLORS = ['#f2c200', '#5fc93f', '#2f9fe0', '#ee5f86', '#a06edb'];
+
+/**
+ * 笔触大小滑块的取值范围 [min, max, step]（PDF 用户空间单位）。
+ *
+ * 0.3.0 起由固定档位（原 PEN_SIZES / MARKER_SIZES / ERASER_SIZES）改为连续滑块：
+ * 真机反馈「档位跨度太粗，想要的值调不出来」。滑块步长对钢笔取 0.5，其余取 1。
+ */
+const SIZE_RANGE: Record<PenSpec['kind'], [number, number, number]> = {
+	pen: [1, 12, 0.5],
+	marker: [6, 40, 1],
+	eraser: [6, 48, 1],
+	lasso: [1, 1, 1],
+};
 
 /** 擦除模式的展示名。 */
 const ERASE_MODE_LABEL: Record<EraseMode, string> = {
@@ -341,31 +355,26 @@ export class InkUI {
 			colorPop.toggleClass('is-open', !colorPop.hasClass('is-open'));
 		});
 
-		// ── 粗细 ──
-		const isEraser = this.pens[this.penIndex].kind === 'eraser';
-		const sizeBtn = bar.createDiv('fleur-pdf-ink-btn');
-		setIcon(sizeBtn, 'circle-dot');
-		sizeBtn.setAttribute('aria-label', isEraser ? '橡皮大小' : '粗细');
-		const sizePop = this.buildSizePop();
-		bar.appendChild(sizePop);
-		sizeBtn.addEventListener('click', (e) => {
-			e.stopPropagation();
-			this.closePops(sizePop);
-			sizePop.toggleClass('is-open', !sizePop.hasClass('is-open'));
-		});
-
-		// ── 擦除模式（仅橡皮生效）：像素 / 笔画 / 选区 ──
-		if (isEraser) {
-			const modeBtn = bar.createDiv('fleur-pdf-ink-btn');
-			setIcon(modeBtn, 'box-select');
-			modeBtn.setAttribute('aria-label', `擦除模式：${ERASE_MODE_LABEL[this.eraserMode]}`);
-			const modePop = this.buildEraseModePop();
-			bar.appendChild(modePop);
-			modeBtn.addEventListener('click', (e) => {
+		// ── 粗细（钢笔 / 荧光笔）──
+		// 橡皮不单独占「大小」图标：它的模式与大小一起并进橡皮自己的设置弹层，
+		// 笔盒少一个图标，也少一处「这个图标是干嘛的」的困惑（0.3.0 真机反馈）。
+		const pen = this.pens[this.penIndex];
+		const isEraser = pen.kind === 'eraser';
+		if (!isEraser) {
+			const sizeBtn = bar.createDiv('fleur-pdf-ink-btn');
+			setIcon(sizeBtn, 'circle-dot');
+			sizeBtn.setAttribute('aria-label', '粗细');
+			const sizePop = this.buildSizePop();
+			bar.appendChild(sizePop);
+			sizeBtn.addEventListener('click', (e) => {
 				e.stopPropagation();
-				this.closePops(modePop);
-				modePop.toggleClass('is-open', !modePop.hasClass('is-open'));
+				this.closePops(sizePop);
+				sizePop.toggleClass('is-open', !sizePop.hasClass('is-open'));
 			});
+		} else {
+			// 橡皮设置弹层（像素 / 笔画 / 选区 + 大小）常驻笔盒，
+			// 由「再次点击橡皮图标」展开 —— 见 selectPen 末尾。
+			bar.appendChild(this.buildEraserPop());
 		}
 
 		bar.createDiv('fleur-pdf-ink-sep');
@@ -440,31 +449,64 @@ export class InkUI {
 		return pop;
 	}
 
-	private buildSizePop(): HTMLElement {
+	/**
+	 * 大小滑块（钢笔 / 荧光笔 / 橡皮共用，0.3.0 起替代固定档位圆点）。
+	 *
+	 * 拖动过程只改内存值 + 实时下发参数，**不重建笔盒**（重建会让滑块在手指下消失）；
+	 * 松手（change）时才落盘。橡皮不吃引擎参数 —— 它的 thickness 就是命中半径，
+	 * 由 eraseAtPoint 实时读取，所以拖动即时生效。
+	 */
+	private buildSizeSlider(): HTMLElement {
 		const pen = this.pens[this.penIndex];
-		const pop = createDiv('fleur-pdf-ink-pop fleur-pdf-ink-sizes');
-		const sizes = pen.kind === 'eraser' ? ERASER_SIZES : pen.kind === 'marker' ? MARKER_SIZES : PEN_SIZES;
-		for (const s of sizes) {
-			const item = pop.createDiv('fleur-pdf-ink-size');
-			item.createDiv('fleur-pdf-ink-size-dot').setCssStyles({
-				width: `${Math.min(4 + s, 18)}px`,
-				height: `${Math.min(4 + s, 18)}px`,
-			});
-			if (s === pen.thickness) item.addClass('is-active');
-			item.addEventListener('click', (e) => {
-				e.stopPropagation();
-				void this.setSize(s);
-			});
+		const [min, max, step] = SIZE_RANGE[pen.kind];
+		const row = createDiv('fleur-pdf-ink-slider-row');
+
+		const input = row.createEl('input', { cls: 'fleur-pdf-ink-slider' });
+		input.type = 'range';
+		input.min = String(min);
+		input.max = String(max);
+		input.step = String(step);
+		input.value = String(pen.thickness);
+
+		const value = row.createDiv('fleur-pdf-ink-slider-val');
+		value.setText(String(pen.thickness));
+
+		// 滑块自己吃掉指针事件，避免冒泡到 body 的「点空白收起面板」逻辑
+		for (const ev of ['pointerdown', 'touchstart', 'click']) {
+			input.addEventListener(ev, (e) => e.stopPropagation());
 		}
+
+		input.addEventListener('input', () => {
+			const v = Number(input.value);
+			const cur = this.pens[this.penIndex];
+			cur.thickness = v;
+			value.setText(String(v));
+			if (cur.kind === 'pen' || cur.kind === 'marker') this.engine.applyPen(cur);
+		});
+		input.addEventListener('change', () => this.persist());
+
+		return row;
+	}
+
+	/** 粗细弹层（单根滑块）。 */
+	private buildSizePop(): HTMLElement {
+		const pop = createDiv('fleur-pdf-ink-pop fleur-pdf-ink-sizes');
+		pop.appendChild(this.buildSizeSlider());
 		return pop;
 	}
 
-	/** 擦除模式弹层（像素 / 笔画 / 选区）。 */
-	private buildEraseModePop(): HTMLElement {
-		const pop = createDiv('fleur-pdf-ink-pop fleur-pdf-ink-modes');
+	/**
+	 * 橡皮设置弹层：擦除模式（像素 / 笔画 / 选区）+ 大小滑块。
+	 *
+	 * 0.3.0 起并入橡皮图标本身（再次点击已选中的橡皮图标即展开），
+	 * 不再单独占一个 `box-select` 图标 —— 真机反馈「多出来那个图标不知道是干什么的」。
+	 */
+	private buildEraserPop(): HTMLElement {
+		const pop = createDiv('fleur-pdf-ink-pop fleur-pdf-ink-eraser-pop');
 		const modes: EraseMode[] = ['pixel', 'stroke', 'select'];
+		const modeRow = pop.createDiv('fleur-pdf-ink-modes');
 		for (const m of modes) {
-			const item = pop.createDiv('fleur-pdf-ink-size fleur-pdf-ink-mode');
+			const item = modeRow.createDiv('fleur-pdf-ink-mode');
 			item.setText(ERASE_MODE_LABEL[m]);
 			if (m === this.eraserMode) item.addClass('is-active');
 			item.addEventListener('click', (e) => {
@@ -472,12 +514,15 @@ export class InkUI {
 				this.setEraseMode(m);
 			});
 		}
+		pop.appendChild(this.buildSizeSlider());
 		return pop;
 	}
 
 	/* ============================ 笔操作 ============================ */
 
 	private async selectPen(i: number): Promise<void> {
+		// 记录「点的就是当前已选中的那支」——橡皮要靠它判断是否展开设置弹层
+		const wasSame = this.penIndex === i;
 		this.penIndex = i;
 		const pen = this.pens[i];
 		// 离开套索时清掉选择集 —— 带着选择去画/擦，行为会互相纠缠
@@ -497,6 +542,18 @@ export class InkUI {
 		}
 		this.persist();
 		this.refreshPenBar();
+		// 再次点击橡皮图标 → 展开橡皮设置（擦除模式 + 大小）。
+		// 让「擦除模式」并入橡皮图标，而不是另占一个图标。
+		if (pen.kind === 'eraser' && wasSame) this.openEraserPop();
+	}
+
+	/** 展开橡皮设置弹层（像素 / 笔画 / 选区 + 大小）。 */
+	private openEraserPop(): void {
+		const pop = this.penBar?.querySelector<HTMLElement>('.fleur-pdf-ink-eraser-pop');
+		if (!pop) return;
+		const willOpen = !pop.hasClass('is-open');
+		this.closePops(pop);
+		pop.toggleClass('is-open', willOpen);
 	}
 
 	private async setColor(color: string): Promise<void> {
@@ -506,19 +563,20 @@ export class InkUI {
 		this.refreshPenBar();
 	}
 
-	private async setSize(size: number): Promise<void> {
-		this.pens[this.penIndex].thickness = size;
-		await this.applyActivePen();
-		this.persist();
-		this.refreshPenBar();
-	}
-
-	/** 切换擦除模式（仅橡皮生效；随切换写回设置）。 */
+	/**
+	 * 切换擦除模式（仅橡皮生效；随切换写回设置）。
+	 *
+	 * 注意：这里**不重建笔盒**。模式选项就挂在橡皮设置弹层里，
+	 * 重建会把用户刚展开的面板一起销毁。只翻转面板内的选中态即可。
+	 */
 	private setEraseMode(mode: EraseMode): void {
 		this.eraserMode = mode;
 		this.clearEraseRect();
 		this.persist();
-		this.refreshPenBar();
+		const modes: EraseMode[] = ['pixel', 'stroke', 'select'];
+		this.penBar
+			?.findAll('.fleur-pdf-ink-eraser-pop .fleur-pdf-ink-mode')
+			.forEach((el, idx) => el.toggleClass('is-active', modes[idx] === mode));
 	}
 
 	private async applyActivePen(): Promise<void> {
@@ -551,8 +609,41 @@ export class InkUI {
 		this.eraserDetach = null;
 		this.lassoDetach?.();
 		this.lassoDetach = null;
+		this.detachDrawSettle();
 		if (mode === 'eraser') this.attachEraser();
 		else if (mode === 'lasso') this.attachLasso();
+		else this.attachDrawSettle();
+	}
+
+	/* ---------------- 落笔收尾：让笔迹保持「未选中」 ----------------
+	 * pdf.js 在 INK 模式下每画一笔都会把新编辑器留在 #selectedEditors 里
+	 * （`unselectAll()` 在 mode !== NONE 时不清选择集，见 ink-engine.releaseSelection）。
+	 * 不处理的话每一笔都带选中描边 —— 真机表现就是「一片选区框把几笔串起来」，
+	 * 而且后续任何一次改参数都有可能顺着选择集改到历史笔迹。
+	 * 用户明确要求手写时不得出现选区框，所以每次落笔后立刻把它释放掉。
+	 */
+	private drawSettleDetach: (() => void) | null = null;
+
+	private attachDrawSettle(): void {
+		if (this.drawSettleDetach) return;
+		const onUp = (e: PointerEvent): void => {
+			if (!this.active || !this.isInPdfArea(e.target)) return;
+			// 延到下一宏任务：等 pdf.js 完成本次绘制收尾（编辑器此刻才真正诞生）
+			window.setTimeout(() => {
+				if (this.active) this.engine.releaseSelection();
+			}, 0);
+		};
+		window.addEventListener('pointerup', onUp, { capture: true });
+		window.addEventListener('pointercancel', onUp, { capture: true });
+		this.drawSettleDetach = () => {
+			window.removeEventListener('pointerup', onUp, { capture: true });
+			window.removeEventListener('pointercancel', onUp, { capture: true });
+		};
+	}
+
+	private detachDrawSettle(): void {
+		this.drawSettleDetach?.();
+		this.drawSettleDetach = null;
 	}
 
 	private attachEraser(): void {
@@ -995,27 +1086,32 @@ export class InkUI {
 	/** 手势盾的卸载器。 */
 	private gestureShieldDetach: (() => void) | null = null;
 
+	/**
+	 * 目标是否落在 PDF 滚动区域内。
+	 * 笔盒与模式切换器挂在 document.body 下（不在 scrollHost 内），天然被排除 ——
+	 * 这是「只在 PDF 区域接管触摸」的唯一依据。
+	 */
+	private isInPdfArea(target: EventTarget | null): boolean {
+		const el = target as HTMLElement | null;
+		return !!el && !!this.scrollHost && (el === this.scrollHost || this.scrollHost.contains(el));
+	}
+
 	private attachGestureShield(): void {
 		if (this.gestureShieldDetach) return;
 
-		const inPdfArea = (target: EventTarget | null): boolean => {
-			const el = target as HTMLElement | null;
-			return !!el && !!this.scrollHost && (el === this.scrollHost || this.scrollHost.contains(el));
-		};
-
 		const onTouchStart = (e: TouchEvent): void => {
-			if (!this.active || !inPdfArea(e.target)) return;
+			if (!this.active || !this.isInPdfArea(e.target)) return;
 			// 阻断 Obsidian 的边缘滑动 / 手势识别（document 级监听全部收不到）
 			e.stopPropagation();
 		};
 		const onTouchMove = (e: TouchEvent): void => {
-			if (!this.active || !inPdfArea(e.target)) return;
+			if (!this.active || !this.isInPdfArea(e.target)) return;
 			e.stopPropagation();
 			// 阻掉 WebKit 原生滚动与回弹 —— 滚动由触摸路由自己驱动
 			e.preventDefault();
 		};
 		const onTouchEnd = (e: TouchEvent): void => {
-			if (!this.active || !inPdfArea(e.target)) return;
+			if (!this.active || !this.isInPdfArea(e.target)) return;
 			e.stopPropagation();
 		};
 
@@ -1210,11 +1306,12 @@ export class InkUI {
 		this.touchRouterDetach = null;
 	}
 
-	/** 卸载橡皮 / 套索的输入接管（退出手写模式时调用，避免监听器跨模式残留）。 */
+	/** 卸载橡皮 / 套索 / 落笔收尾的输入接管（退出手写模式时调用，避免监听器跨模式残留）。 */
 	private detachPenInput(): void {
 		this.eraserDetach?.();
 		this.eraserDetach = null;
 		this.lassoDetach?.();
 		this.lassoDetach = null;
+		this.detachDrawSettle();
 	}
 }
