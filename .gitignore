@@ -30,3 +30,6 @@ test-doc.md
 debug-*.js
 DEPLOY.md
 STATUS.md
+
+# 离线 QA 复现页与 Playwright 探针（含本机 node 绝对路径，不入库）
+.qa/

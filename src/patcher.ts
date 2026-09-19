@@ -158,6 +158,12 @@ export class PDFPatcher {
   private lastAutoMenuKey = '';
   /** 当前打开的浮动面板（同一时刻只允许一个，选区连续变化时会重建）。 */
   private openPanel: HTMLElement | null = null;
+  /** 当前面板「点击外部关闭」的监听器，由 hideContextMenu 统一摘除。 */
+  private contextMenuCloser: ((e: Event) => void) | null = null;
+  /** 面板最近一次显示的时刻：选区清空后要等 350ms 才收，避免拖手柄时闪掉。 */
+  private contextMenuShownAt = 0;
+  /** 面板请求的代际号：让 await 期间被超越的旧请求自行作废（见 showContextMenu）。 */
+  private contextMenuEpoch = 0;
   private commentBubbles: CommentBubble[] = [];
   private lastSnapshot: SelectionSnapshot | null = null;
   /** 快照有效期：活选区被清空后，右键仍可用最近一次选区 */
@@ -855,21 +861,36 @@ export class PDFPatcher {
     if (this.selectionMenuTimer !== null) window.clearTimeout(this.selectionMenuTimer);
     this.selectionMenuTimer = window.setTimeout(() => {
       this.selectionMenuTimer = null;
-      this.maybeShowMobileMenu();
-    }, 320);
+      this.syncMobileMenuWithSelection();
+    }, 300);
   }
 
-  /** 选区稳定后：校验选区确实落在 PDF 文本框里，然后就地弹出批注面板。 */
-  private maybeShowMobileMenu(): void {
-    // 手写模式下 textLayer 已禁选，这里再兜一层，避免残留选区误弹
-    if (document.body.classList.contains('fleur-pdf-ink-active')) return;
-    if (!this.currentPagePath) return;
+  /**
+   * 选区稳定后同步批注面板：有选区就弹（或保持），没选区就收。
+   *
+   * 语义与 FleurEPUB 的 `selectionchange` 处理完全一致 —— 它用的是
+   * 「稳定 300ms 后有选区就显示工具条 / 无选区且已显示超过 350ms 就隐藏」。
+   * 两个数字直接照搬，那是真机调出来的手感：去掉隐藏分支就会留下一个
+   * 「选区早没了、面板还杵在那」的僵尸面板。
+   */
+  private syncMobileMenuWithSelection(): void {
+    // 手写模式下 textLayer 已禁选：既不再弹，也要把可能在切换前留下的面板收掉
+    if (document.body.classList.contains('fleur-pdf-ink-active')) {
+      this.hideContextMenu();
+      return;
+    }
 
     const selection = window.getSelection();
-    if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
+    const text =
+      selection && !selection.isCollapsed && selection.rangeCount > 0 ? selection.toString().trim() : '';
 
-    const text = selection.toString().trim();
-    if (!text) return;
+    if (!text || !selection) {
+      // 选区被清空（点空白 / 取消选择）→ 面板跟着收起来
+      if (this.openPanel?.isConnected && Date.now() - this.contextMenuShownAt > 350) this.hideContextMenu();
+      return;
+    }
+
+    if (!this.currentPagePath) return;
 
     // 焦点在输入框 / 我们自己的面板里 → 不弹（批注编辑中、AI 提问中）
     const active = document.activeElement as HTMLElement | null;
@@ -882,14 +903,16 @@ export class PDFPatcher {
       : anchorNode.parentElement) as HTMLElement | null;
     if (!anchor || !this.isInPDFView(anchor)) return;
 
-    // 同一段选区不重复弹（selectionchange 可能因无关原因再次触发）
-    const key = `${ text.length }|${ text.slice(0, 48) }`;
-    if (key === this.lastAutoMenuKey) return;
-
     const snapshot = this.buildSnapshotFromSelection(selection);
     if (!snapshot?.text) return;
 
+    // 同一段选区且面板已经开着 → 原样保持，不重建（重建会让面板闪一下）。
+    // 注意条件里必须带 `this.openPanel`：旧版只比 key，而 key 一旦记下就永不清空，
+    // 于是「同一段文字第二次选中」时菜单根本不出现，用户以为功能又坏了。
+    const key = `${ text.length }|${ text.slice(0, 48) }`;
+    if (key === this.lastAutoMenuKey && this.openPanel?.isConnected) return;
     this.lastAutoMenuKey = key;
+
     const rect = range.getBoundingClientRect();
     void this.showContextMenu(
       Math.min(Math.max(8, rect.left + rect.width / 2), Math.max(8, window.innerWidth - 8)),
@@ -909,7 +932,36 @@ export class PDFPatcher {
     return null;
   }
 
+  /**
+   * 关闭当前的文本批注面板（单实例语义）。
+   *
+   * 对齐 FleurEPUB 的选区工具条做法：它只维护一个 `selToolbar` 引用，
+   * 任何新工具条出现前先 hide 旧的；面板消失时（选区被清空）也主动 hide。
+   * 本插件此前缺这两条 —— openPanel 字段声明了却从未赋值，于是每弹一次就
+   * 往 body 上叠一个新的，真机表现为「选字后菜单反复弹、叠成一片」。
+   */
+  private hideContextMenu(): void {
+    if (this.contextMenuCloser) {
+      document.removeEventListener('pointerdown', this.contextMenuCloser, true);
+      this.contextMenuCloser = null;
+    }
+    this.openPanel?.remove();
+    this.openPanel = null;
+  }
+
+  /** 外部强制收起浮动面板（进入手写模式时调用：移动端选不出文本，面板只会挡路）。 */
+  closeFloatingMenu(): void {
+    // 代际 +1：把「已在 await 途中、还没来得及创建面板」的那次请求一并作废，
+    // 否则它会在手写模式已经打开之后又把面板弹出来。
+    this.contextMenuEpoch++;
+    this.hideContextMenu();
+  }
+
   private async showContextMenu(_x: number, _y: number, snapshot: SelectionSnapshot, hitAnnIds: string[] = []) {
+    // 本次请求的代际。下面有 await，快速连续选字时可能多个请求同时在途，
+    // 而它们的耗时不定 —— 可能出现「旧快照后落地、盖掉新面板」。await 之后校验一次。
+    const epoch = ++this.contextMenuEpoch;
+
     const s = this.plugin.settings;
     const underlineColor = s.underlineColor || '#6B0000';
     const highlightColors = s.highlightColors.length >= 3
@@ -930,8 +982,21 @@ export class PDFPatcher {
       }
     }
 
+    // await 期间有更新的请求进来（或被强制关闭）→ 本次让位，不再创建面板
+    if (epoch !== this.contextMenuEpoch) return;
+
+    // 单实例：先把上一个面板收掉。
+    // 此前这里缺了这一步（openPanel 字段声明了却从未赋值），于是选区每稳定一次
+    // 就往 body 上叠一个新面板 —— 真机表现就是「选中文本后菜单反复弹出、越叠越多，
+    // 挡住正文没法继续干活」。FleurEPUB 的选区工具条是同样的单实例语义。
+    this.hideContextMenu();
+
     // 创建浮动面板
     const panel = createDiv({ cls: 'fleur-context-panel' });
+    this.openPanel = panel;
+    this.contextMenuShownAt = Date.now();
+    /** 关闭当前面板（各按钮动作完成后统一走它，保证 openPanel 被清空）。 */
+    const close = () => this.hideContextMenu();
 
     // 复制
     const copyBtn = panel.createEl('button');
@@ -940,23 +1005,28 @@ export class PDFPatcher {
     iconCopy(copyBtn);
     copyBtn.addEventListener('click', () => {
       void navigator.clipboard.writeText(text).then(() => new Notice('已复制'));
-      panel.remove();
+      close();
     });
 
     // 分隔
     panel.createDiv({ cls: 'fleur-context-sep' });
 
     // 三个高亮颜色圆点
-    const hlGroup = panel.createDiv({ cls: 'fleur-context-group' });
+    const hlGroup = panel.createDiv('fleur-context-group');
     highlightColors.forEach((color, idx) => {
       const hlBtn = hlGroup.createEl('button');
       hlBtn.addClass('fleur-context-item', 'fleur-context-hl');
       hlBtn.title = `高亮 ${idx + 1}`;
       const dot = hlBtn.createDiv({ cls: 'fleur-context-hl-dot' });
-      dot.setCssStyles({ background: color });
+      // 尺寸走行内样式，不依赖插件 styles.css。
+      // 依据：移动端 WebView 里样式表的加载时序与优先级都不可靠，靠 CSS 给宽高的
+      // 元素会渲染成 0×0 —— SVG 图标当初整片看不见就是这个原因，而它后来之所以好了，
+      // 正是因为 svgIcon 把 width/height 写成了元素自身的属性。
+      // 三个颜色圆点走的仍是 CSS 尺寸，于是成了「图标有了、颜色没了」的那半边。
+      dot.setCssStyles({ background: color, width: '20px', height: '20px', borderRadius: '50%' });
       hlBtn.addEventListener('click', () => {
         void this.applyHighlight(text, pageNum, pages, color, 'highlight', filePath, endPage);
-        panel.remove();
+        close();
       });
     });
 
@@ -970,7 +1040,7 @@ export class PDFPatcher {
     iconUnderlineSolid(solidUlBtn, underlineColor);
     solidUlBtn.addEventListener('click', () => {
       void this.applyUnderline(text, pageNum, pages, 'solid', underlineColor, filePath, endPage);
-      panel.remove();
+      close();
     });
 
     // 划线 - 波浪
@@ -980,7 +1050,7 @@ export class PDFPatcher {
     iconUnderlineWavy(wavyUlBtn, underlineColor);
     wavyUlBtn.addEventListener('click', () => {
       void this.applyUnderline(text, pageNum, pages, 'wavy', underlineColor, filePath, endPage);
-      panel.remove();
+      close();
     });
 
     // 分隔
@@ -993,7 +1063,7 @@ export class PDFPatcher {
     iconComment(commentBtn);
     commentBtn.addEventListener('click', () => {
       this.showCommentDialog(text, pageNum, pages, filePath, endPage);
-      panel.remove();
+      close();
     });
 
     // 分隔
@@ -1006,7 +1076,7 @@ export class PDFPatcher {
     iconAI(askBtn);
     askBtn.addEventListener('click', () => {
       this.askAI(text, '请回答关于这段内容的问题', _x, _y);
-      panel.remove();
+      close();
     });
 
     // 分隔
@@ -1019,7 +1089,7 @@ export class PDFPatcher {
     iconTranslate(translateBtn);
     translateBtn.addEventListener('click', () => {
       this.askAITranslate(text, _x, _y);
-      panel.remove();
+      close();
     });
 
     // 清除标注（右键点击处命中标注层时显示 — 分层列出，叠加标注逐项清除）
@@ -1031,7 +1101,7 @@ export class PDFPatcher {
         clearBtn.title = this.describeAnnotation(item.ann);
         iconEraser(clearBtn);
         clearBtn.addEventListener('click', () => {
-          panel.remove();
+          close();
           void this.removeAnnotationFromPdf(item.id, item.ann);
         });
       }
@@ -1042,12 +1112,13 @@ export class PDFPatcher {
     // mousedown 在部分 WebView 里要等 300ms 才合成，面板会「点外面关不掉」。
     const closeHandler = (e: Event) => {
       if (panel.contains(e.target as Node)) return;
-      panel.remove();
-      document.removeEventListener('pointerdown', closeHandler, true);
-      if (this.openPanel === panel) this.openPanel = null;
+      this.hideContextMenu();
     };
+    this.contextMenuCloser = closeHandler;
     window.setTimeout(() => {
-      document.addEventListener('pointerdown', closeHandler, true);
+      // 这一拍内面板可能已被关掉（连续选字会重建面板），此时不要再挂监听，
+      // 否则会积下一堆永不触发也永不释放的 document 级监听。
+      if (this.openPanel === panel) document.addEventListener('pointerdown', closeHandler, true);
     }, 0);
 
     // 定位面板（确保不超出视口）
@@ -2044,8 +2115,7 @@ export class PDFPatcher {
       window.clearTimeout(this.selectionMenuTimer);
       this.selectionMenuTimer = null;
     }
-    this.openPanel?.remove();
-    this.openPanel = null;
+    this.hideContextMenu();
     this.stopPdfViewerWatcher();
     this.commentBubbles.forEach(b => b.el.remove());
     this.commentBubbles = [];

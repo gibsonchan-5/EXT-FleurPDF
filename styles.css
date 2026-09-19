@@ -1545,6 +1545,25 @@ body.fleur-pdf-mobile .fleur-pdf-lasso-overlay path {
   stroke-linejoin: round;
 }
 
+/* 圈选完成后**保留**的选区虚线边界（GoodNotes 语义）。
+   自绘原因：编辑层的 border/outline 已被手写模式的全局 CSS 抹平
+   （为了避免「每一笔都带选中描边、相邻几笔像被一个框串起来」），
+   而 GoodNotes 要的是「整组一个框」。所以框由 ink-ui 自己画。
+   0.4.0 真机反馈「套索圈住了却看不到圈的是哪块」即此。
+   background 先给 rgba 兜底，再给 color-mix（老 WebView 忽略后者即可）。 */
+body.fleur-pdf-mobile .fleur-pdf-lasso-box {
+  position: fixed;
+  z-index: 999;
+  pointer-events: none;
+  box-sizing: border-box;
+  border: 1.5px dashed var(--interactive-accent);
+  border-radius: 6px;
+  /* 填充压到几乎看不见：框要「标出范围」，不能把底下的正文蒙住。
+     实测量过 7% 在浅色主题下已是明显的淡紫块，故降到 4%。 */
+  background-color: rgba(124, 58, 237, 0.04);
+  background-color: color-mix(in srgb, var(--interactive-accent) 4%, transparent);
+}
+
 /* ── 手写模式下的画面调整 ── */
 
 /* 原生 editToolbar 整块让位给自建笔盒，避免两套 UI 叠在一起。
@@ -1654,11 +1673,20 @@ body.fleur-pdf-mobile .fleur-pdf-ink-eraser-pop .fleur-pdf-ink-modes {
    桌面端 28px 的按钮在平板上点不准（真机反馈）；移动端整体放大到 40px 命中区，
    并给容器加横向滚动兜住小屏（按钮变多时不会溢出屏幕）。 */
 body.fleur-pdf-mobile .fleur-context-panel {
+  /* max-width 约束的是内容盒：缺 box-sizing 时还要再叠加 16px padding 与 2px 边框。
+     实测（Playwright 复现 412px 视口）：面板总宽 414px、scrollWidth 449 > clientWidth 412，
+     即面板比屏幕还宽 —— 右侧按钮被切在屏幕外，且整个面板横向可拖。
+     这不是「按钮不见了」，是它们被推到了视野之外。 */
+  box-sizing: border-box;
   gap: 5px;
   padding: 8px;
   border-radius: 12px;
   max-width: calc(100vw - 16px);
   overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  /* 面板内部的横向滚动自己处理，别让 Obsidian 的触摸手势半路接管 */
+  touch-action: pan-x;
 }
 
 body.fleur-pdf-mobile .fleur-context-item {

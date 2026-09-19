@@ -65,6 +65,15 @@ const SIZE_RANGE: Record<PenSpec['kind'], [number, number, number]> = {
 	lasso: [1, 1, 1],
 };
 
+/**
+ * 空闲自动落盘的防抖时长（ms）。
+ *
+ * 写回 PDF 是重操作（重新序列化整份 PDF + 先备份原文件 + 原地改写），
+ * 对几十 MB 的 PDF 是百毫秒级的活；太短会反复重写，太长则「关掉 App 时」
+ * 丢的内容多。12 秒是「一笔一停手就看得到结果」与「不折腾磁盘」的折中。
+ */
+const AUTO_SAVE_IDLE_MS = 12000;
+
 /** 擦除模式的展示名。 */
 const ERASE_MODE_LABEL: Record<EraseMode, string> = {
 	pixel: '像素擦除',
@@ -107,6 +116,12 @@ export class InkUI {
 	private eraserMode: EraseMode;
 	/** 手写模式激活期间是否只允许笔输入（真机笔 vs 手指）。 */
 	private readonly storage: InkStorage;
+	/** 空闲自动落盘的防抖计时器（见 autoSave）。 */
+	private autoSaveTimer: number | null = null;
+	/** 写盘互斥：写回 PDF 是重操作，同一时刻只允许一个在跑。 */
+	private saving = false;
+	/** 本会话是否已提示过保存失败（自动保存的失败多为视图切换途中的一次性错误，避免刷屏）。 */
+	private saveErrorNotified = false;
 
 	constructor(
 		private plugin: FleurPDFPlugin,
@@ -192,6 +207,22 @@ export class InkUI {
 
 		document.body.addEventListener('click', this.onBodyClick, true);
 
+		// ── 离开当前 PDF 前的兜底落盘（见 autoSave）──
+		// 真机 0.4.0 反馈「手写批注之后关闭文件，重新回来全部批注都消失了」：
+		// 批注此前只活在 pdf.js 的内存 AnnotationStorage 里，唯一出口是笔盒上的
+		// 保存钮 —— 而「写完直接关文件」才是最自然的操作，于是必然丢。
+		this.plugin.registerEvent(
+			this.plugin.app.workspace.on('file-open', (file) => {
+				void this.flushBeforeLeave(file?.path ?? null);
+			}),
+		);
+		this.plugin.registerEvent(
+			this.plugin.app.workspace.on('layout-change', () => {
+				const path = this.plugin.app.workspace.getActiveFile()?.path ?? null;
+				void this.flushBeforeLeave(path);
+			}),
+		);
+
 		// M3-A：首次挂载给一条指引入口在哪（只在本会话第一次出现）。
 		// 带上版本号：真机排查时「到底装没装上这一版」是最先要确认的事，
 		// 之前就吃过 BRAT 未更新却在排查已修问题的亏。
@@ -211,7 +242,10 @@ export class InkUI {
 
 	unmount(): void {
 		document.body.removeEventListener('click', this.onBodyClick, true);
-		if (this.active) this.exitInk();
+		// 卸载前尽力落盘（异步发起，不阻塞卸载流程）
+		if (this.active) void this.exitInk();
+		this.cancelAutoSave();
+		this.hideLassoBox();
 		this.toggleBtn?.remove();
 		this.toggleBtn = null;
 		this.editSeg = null;
@@ -229,6 +263,9 @@ export class InkUI {
 	/* ============================ 模式切换 ============================ */
 
 	async enterInk(): Promise<void> {
+		// 手写模式下选不出文本，文本批注面板留着只会挡住落笔区域
+		this.plugin.patcher?.closeFloatingMenu();
+
 		// 每次进入都重新解析：视图可能刚被重建（切换文件、重新打开）
 		const handle = await this.engine.resolve();
 		if (!handle) {
@@ -273,6 +310,12 @@ export class InkUI {
 	}
 
 	async exitInk(): Promise<void> {
+		// 退出即落盘。点「完成」的用户语义是「我写完了」，此时把批注留在内存里
+		// 等于让他在下次打开文件时发现全没了（真机 0.4.0 的主诉）。
+		// 没有未保存内容时 autoSave 直接跳过，不会白白重写文件。
+		this.cancelAutoSave();
+		await this.autoSave(false);
+
 		// 先提交：supportMultipleDrawings=true 时 pointerup 不会生成编辑器，
 		// 必须显式提交（或切模式，这里两者都做），否则最后一笔会丢。
 		await this.engine.commit();
@@ -293,30 +336,104 @@ export class InkUI {
 		this.persist();
 	}
 
-	/** 把手写层的待保存批注写回 PDF。 */
+	/** 笔盒上的保存钮：显式写回 PDF。 */
 	private async save(): Promise<void> {
-		// 提交当前会话，否则最后一笔不在存储里
-		this.engine.commit();
-		await new Promise((r) => window.setTimeout(r, 80));
+		this.cancelAutoSave();
+		const wrote = await this.autoSave(false);
+		// 文件已被改写：退出编辑态，避免继续在旧的内存文档上落墨
+		if (wrote) await this.exitInk();
+	}
 
-		if (!this.engine.hasUnsaved) {
-			new Notice('没有需要保存的手写批注');
-			return;
-		}
-		const file = this.engine.getFile();
-		if (!file) {
-			new Notice('找不到对应的 PDF 文件');
-			return;
-		}
+	/* ============================ 自动落盘 ============================ */
 
-		const out = await this.storage.saveAnnotated(this.engine, file);
-		if (out.ok) {
-			new Notice(`已写入手写批注（${Math.round((out.bytes ?? 0) / 1024)} KB）`);
-			// 文件已被改写，重开视图才能拿到干净的状态
-			await this.exitInk();
-		} else {
-			new Notice(`写入失败：${out.error ?? '未知原因'}`);
+	/**
+	 * 把内存中的手写批注写回 PDF。
+	 *
+	 * 真机 0.4.0 的「批注之后关闭文件、重新回来全没了」就出在这里：
+	 * 批注此前只存在于 pdf.js 的 AnnotationStorage（纯内存），唯一出口是笔盒上的
+	 * 保存钮 —— 而「写完直接关文件」才是最自然的用法，所以必然丢数据。
+	 *
+	 * 三层保障：
+	 *   ① 每次落笔 / 擦除 / 套索改动后，空闲 AUTO_SAVE_IDLE_MS 静默写回 ——
+	 *      兜住「不点保存直接杀掉 App」；
+	 *   ② 退出手写模式（点 ✓）时立刻写回（exitInk）；
+	 *   ③ 切换文件 / 工作区布局变化时兜底写回（flushBeforeLeave）。
+	 *
+	 * @param silent 静默模式：无内容可存时不提示，成功也不提示（失败仍会提示）。
+	 * @returns 是否真的写回了文件。
+	 */
+	private async autoSave(silent: boolean): Promise<boolean> {
+		if (this.saving) {
+			// 写盘进行中：静默模式下直接跳过（下一次改动会重新排队），
+			// 显式点保存则要告诉用户「不是没保存，是正在保存」
+			if (!silent) new Notice('正在保存手写批注，请稍候');
+			return false;
 		}
+		this.saving = true;
+		try {
+			// 提交当前绘制会话，否则最后一笔还不在存储里
+			this.engine.commit();
+			// commit() 是同步接口，但落进 AnnotationStorage 要等一拍（见 ink-engine 陷阱 4）
+			await new Promise((r) => window.setTimeout(r, 60));
+
+			if (!this.engine.hasUnsaved) {
+				if (!silent) new Notice('当前没有需要保存的手写批注');
+				return false;
+			}
+			const file = this.engine.getFile();
+			if (!file) {
+				new Notice('找不到对应的 PDF 文件，无法保存手写批注');
+				return false;
+			}
+
+			const out = await this.storage.saveAnnotated(this.engine, file);
+			if (out.ok) {
+				if (!silent) new Notice(`已写入手写批注（${Math.round((out.bytes ?? 0) / 1024)} KB）`);
+				return true;
+			}
+			// 失败必须让用户知道 —— 静默失败会直接变成「批注又没了」。
+			// 但自动保存的失败多半是「视图正在切换途中已被销毁」这类一次性的，
+			// 每次都弹会变成噪音，所以每个会话只提示一次。
+			if (!silent || !this.saveErrorNotified) {
+				this.saveErrorNotified = true;
+				new Notice(`手写批注保存失败：${out.error ?? '未知原因'}`);
+			}
+			return false;
+		} finally {
+			this.saving = false;
+		}
+	}
+
+	/** 安排一次空闲落盘（每次改动后调用，重复调用只保留最后一次）。 */
+	private scheduleAutoSave(): void {
+		if (this.autoSaveTimer !== null) window.clearTimeout(this.autoSaveTimer);
+		this.autoSaveTimer = window.setTimeout(() => {
+			this.autoSaveTimer = null;
+			void this.autoSave(true);
+		}, AUTO_SAVE_IDLE_MS);
+	}
+
+	private cancelAutoSave(): void {
+		if (this.autoSaveTimer !== null) {
+			window.clearTimeout(this.autoSaveTimer);
+			this.autoSaveTimer = null;
+		}
+	}
+
+	/**
+	 * 要离开当前 PDF 了（切文件 / 布局变化）→ 兜底落盘。
+	 *
+	 * 只在「手写模式开着」且「当前 PDF 确实换了」时才动手：
+	 * layout-change 在许多无关场合（开侧边栏、拖分屏）都会触发，
+	 * 不加这两道闸会在用户只是调个界面时反复重写文件。
+	 */
+	private async flushBeforeLeave(nextPath: string | null): Promise<void> {
+		if (!this.active) return;
+		const cur = this.engine.pdfFilePath;
+		if (!cur) return;
+		if (nextPath && nextPath === cur) return;
+		this.cancelAutoSave();
+		await this.autoSave(true);
 	}
 
 	/* ============================ 笔盒 ============================ */
@@ -636,7 +753,10 @@ export class InkUI {
 			if (!this.active || !this.isInPdfArea(e.target)) return;
 			// 延到下一宏任务：等 pdf.js 完成本次绘制收尾（编辑器此刻才真正诞生）
 			window.setTimeout(() => {
-				if (this.active) this.engine.releaseSelection();
+				if (!this.active) return;
+				this.engine.releaseSelection();
+				// 落笔即排一次空闲落盘（见 autoSave 的三层保障）
+				this.scheduleAutoSave();
 			}, 0);
 		};
 		window.addEventListener('pointerup', onUp, { capture: true });
@@ -695,6 +815,8 @@ export class InkUI {
 			}
 			this.eraserDown = false;
 			this.lastErasePt = null;
+			// 一次擦除手势结束 → 排一次空闲落盘
+			this.scheduleAutoSave();
 		};
 
 		host.addEventListener('pointerdown', onDown, { capture: true });
@@ -831,6 +953,7 @@ export class InkUI {
 		});
 		if (r.changed) {
 			this.engine.commit();
+			this.scheduleAutoSave();
 			new Notice(`已擦除 ${r.removedStrokes} 笔`);
 		}
 	}
@@ -854,6 +977,20 @@ export class InkUI {
 	/** 移动中的实时位移（屏幕 px），松手时换算成 PDF 坐标重建。 */
 	private lassoOverlay: SVGSVGElement | null = null;
 	private lassoPathEl: SVGPathElement | null = null;
+	/**
+	 * 圈选完成后**保留**的选区虚线边界（GoodNotes 语义）。
+	 *
+	 * 为什么要自绘而不是用 pdf.js 原生选中态：0.3.0 为满足「手写时不得出现选区框」
+	 * （真机反复要求）给编辑层加了全局 CSS
+	 * `.annotationEditorLayer .inkEditor { border/outline: none !important }`，
+	 * 连带把套索的选中视觉也一并抹平了 —— 0.4.0 真机反馈「套索圈住了，
+	 * 但看不到圈的是哪一块」正是这个根因。
+	 * 给原生选中态开例外会让每一笔各自描边，与 GoodNotes「整组一个框」不符，
+	 * 所以自绘一个包住整个选择集的虚线框。
+	 */
+	private lassoBoxEl: HTMLElement | null = null;
+	/** 滚动 / 缩放时重算边界框的监听卸载器。 */
+	private lassoBoxDetach: (() => void) | null = null;
 
 	private attachLasso(): void {
 		const host = this.scrollHost ?? document.body;
@@ -894,6 +1031,8 @@ export class InkUI {
 					const div: HTMLElement | null = editor?.div ?? null;
 					if (div?.isConnected) div.style.transform = `translate(${dx}px, ${dy}px)`;
 				}
+				// 虚线边界与笔迹用同一个 transform 跟手，拖动过程中不会脱节
+				if (this.lassoBoxEl) this.lassoBoxEl.style.transform = `translate(${dx}px, ${dy}px)`;
 			} else if (this.lassoGesture === 'select') {
 				const last = this.lassoPts[this.lassoPts.length - 1];
 				if (Math.hypot(pt.x - last.x, pt.y - last.y) >= 3) this.lassoPts.push(pt);
@@ -966,6 +1105,8 @@ export class InkUI {
 		this.lassoSelection = hits;
 		this.lassoPageNumber = pageNumber;
 		if (!r.ok) new Notice(`圈选完成，但部分笔画未能入选（${r.failed} 个）`);
+		// 圈中即画出「这块被选中了」的虚线边界（GoodNotes 同款语义）
+		this.showLassoBox();
 	}
 
 	/** 移动收尾：撤掉 transform，按最终位移做契约重建（删旧建新）。 */
@@ -973,18 +1114,23 @@ export class InkUI {
 		const dxPx = endPt.x - this.lassoStart.x;
 		const dyPx = endPt.y - this.lassoStart.y;
 		const selection = this.lassoSelection;
-		this.lassoSelection = [];
 		this.clearLassoPath();
 
-		// 位移太小当作误触：还原 transform 即可
+		// 位移太小当作误触：还原 transform 即可。
+		// ⚠️ 这里必须把 lassoSelection 放回去 —— 选择集本身没变，只是没拖动，
+		// 清空会让虚线边界就此消失（用户得重新圈一次）。
 		const scale = this.engine.getScaleFactor() || 1;
 		if (Math.hypot(dxPx, dyPx) < 4) {
 			for (const editor of selection) {
 				const div: HTMLElement | null = editor?.div ?? null;
 				if (div) div.style.transform = '';
 			}
+			if (this.lassoBoxEl) this.lassoBoxEl.style.transform = '';
+			this.lassoSelection = selection;
 			return;
 		}
+
+		this.lassoSelection = [];
 
 		const dx = dxPx / scale;
 		const dy = -dyPx / scale; // PDF y 轴向上
@@ -1004,8 +1150,14 @@ export class InkUI {
 				this.engine.selectMany(rebuiltEditors);
 				this.lassoSelection = rebuiltEditors;
 				this.lassoPageNumber = Number(rebuiltEditors[0]?.pageIndex ?? 0) + 1;
+				// 重建换了新的 DOM 节点，边界框必须按新位置重算
+				if (this.lassoBoxEl) this.lassoBoxEl.style.transform = '';
+				this.showLassoBox();
+			} else {
+				this.hideLassoBox();
 			}
 			this.engine.commit();
+			this.scheduleAutoSave();
 		})();
 	}
 
@@ -1021,6 +1173,7 @@ export class InkUI {
 			new Notice(`已删除 ${n} 条手写批注`);
 			this.clearLassoSelectionOnly();
 			this.engine.commit();
+			this.scheduleAutoSave();
 			this.refreshPenBar();
 		} else {
 			new Notice(`删除失败：${r.error ?? '未知原因'}`);
@@ -1029,6 +1182,7 @@ export class InkUI {
 
 	private clearLassoSelectionOnly(): void {
 		this.lassoSelection = [];
+		this.hideLassoBox();
 		try {
 			this.engine.unselectAll();
 		} catch {
@@ -1042,6 +1196,73 @@ export class InkUI {
 		this.lassoSelection = [];
 		this.lassoPageNumber = 0;
 		this.clearLassoPath();
+		this.hideLassoBox();
+	}
+
+	/* ---- 圈选完成后的选区虚线边界（GoodNotes 式常驻边框） ---- */
+
+	/** 按当前选择集的屏幕位置画出 / 更新虚线边界；选择集为空则收起。 */
+	private showLassoBox(): void {
+		const box = screenBBoxOfEditors(this.lassoSelection);
+		if (!box) {
+			this.hideLassoBox();
+			return;
+		}
+		if (!this.lassoBoxEl?.isConnected) {
+			this.hideLassoBox();
+			this.lassoBoxEl = document.body.createDiv('fleur-pdf-lasso-box');
+			this.attachLassoBoxTracking();
+		}
+		// 走到这里说明不是拖动中（拖动只改 transform），先把上一轮的位移清掉
+		this.lassoBoxEl.style.transform = '';
+		this.syncLassoBoxRect(box);
+	}
+
+	/** 把边界框摆到给定屏幕包围盒上（外扩 6px 呼吸边距）。 */
+	private syncLassoBoxRect(box: { minX: number; minY: number; maxX: number; maxY: number }): void {
+		const el = this.lassoBoxEl;
+		if (!el) return;
+		const pad = 6;
+		el.setCssStyles({
+			left: `${box.minX - pad}px`,
+			top: `${box.minY - pad}px`,
+			width: `${Math.max(0, box.maxX - box.minX + pad * 2)}px`,
+			height: `${Math.max(0, box.maxY - box.minY + pad * 2)}px`,
+		});
+	}
+
+	/**
+	 * 页面滚动 / 窗口尺寸变化后重算边界框位置。
+	 * 不做这件事的话，滚动后框会停在原处与笔迹脱节 —— 比不画框更让人困惑。
+	 */
+	private attachLassoBoxTracking(): void {
+		this.lassoBoxDetach?.();
+		const update = (): void => {
+			if (!this.lassoSelection.length) return;
+			const box = screenBBoxOfEditors(this.lassoSelection);
+			if (box) this.syncLassoBoxRect(box);
+		};
+		const host = this.scrollHost;
+		host?.addEventListener('scroll', update, { passive: true });
+		window.addEventListener('resize', update);
+		// pdf.js 缩放（捏合）后页面尺寸变化，ResizeObserver 比 resize 更可靠
+		let ro: ResizeObserver | null = null;
+		if (typeof ResizeObserver === 'function' && host) {
+			ro = new ResizeObserver(update);
+			ro.observe(host);
+		}
+		this.lassoBoxDetach = () => {
+			host?.removeEventListener('scroll', update);
+			window.removeEventListener('resize', update);
+			ro?.disconnect();
+		};
+	}
+
+	private hideLassoBox(): void {
+		this.lassoBoxDetach?.();
+		this.lassoBoxDetach = null;
+		this.lassoBoxEl?.remove();
+		this.lassoBoxEl = null;
 	}
 
 	/* ---- 圈选虚线的实时预览（fixed 全屏 SVG，pointer-events:none）---- */
