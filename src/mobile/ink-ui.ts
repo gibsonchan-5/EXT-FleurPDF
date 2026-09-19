@@ -241,8 +241,10 @@ export class InkUI {
 		// ⚠️ 顺序不可颠倒：必须**先进入编辑模式**，引擎才可能补齐 UIManager。
 		// 因为兜底路径「播种编辑器」依赖当前模式（模式为 0 时 pdf.js 造不出编辑器），
 		// 而笔色/粗细又必须在第一笔落墨**之前**下发。
+		// 0.4.0 起 enterInk 是异步的：NONE → INK 触发 pdf.js 的重路径（updater 要等所有页
+		// pagerendered），applyActivePen 必须等模式真落盘，否则 UIManager 拿不到。
 		const pen = this.pens[this.penIndex];
-		const res = pen.kind === 'marker' ? this.engine.enterMarker() : this.engine.enterInk();
+		const res = pen.kind === 'marker' ? await this.engine.enterMarker() : await this.engine.enterInk();
 		if (!res.ok) {
 			new Notice(`手写模式不可用：${res.error ?? '未知原因'}`);
 			return;
@@ -273,8 +275,8 @@ export class InkUI {
 	async exitInk(): Promise<void> {
 		// 先提交：supportMultipleDrawings=true 时 pointerup 不会生成编辑器，
 		// 必须显式提交（或切模式，这里两者都做），否则最后一笔会丢。
-		this.engine.commit();
-		this.engine.exit();
+		await this.engine.commit();
+		await this.engine.exit();
 
 		this.clearLasso();
 		this.clearEraseRect();
@@ -481,7 +483,9 @@ export class InkUI {
 			const cur = this.pens[this.penIndex];
 			cur.thickness = v;
 			value.setText(String(v));
-			if (cur.kind === 'pen' || cur.kind === 'marker') this.engine.applyPen(cur);
+			// 0.4.0 起 applyPen 是异步的（要等 UIManager），拖动过程是连续的，
+			// 同一帧多次 in-flight 调用没问题：applyPenAsync 内部会按顺序串接 commit / unselectAll。
+			if (cur.kind === 'pen' || cur.kind === 'marker') void this.engine.applyPenAsync(cur);
 		});
 		input.addEventListener('change', () => this.persist());
 
@@ -533,11 +537,11 @@ export class InkUI {
 		} else if (pen.kind === 'lasso') {
 			// 套索不改 annotationEditorMode（与橡皮同理：输入层接管）。
 			// 但若当前不在任何编辑模式（首笔就是套索），先进墨迹模式让编辑器存在。
-			if (!this.engine.getMode()) this.engine.enterInk();
+			if (!this.engine.getMode()) await this.engine.enterInk();
 			this.setPenInputMode('lasso');
 		} else {
 			// 钢笔与荧光笔同走墨迹通道（0.2.0 起）；切换时会按笔重下发参数
-			this.engine.enterInk();
+			await this.engine.enterInk();
 			this.setPenInputMode('draw');
 		}
 		this.persist();
@@ -583,7 +587,9 @@ export class InkUI {
 		const pen = this.pens[this.penIndex];
 		// 橡皮 / 套索没有「笔参数」可下发（橡皮是输入层接管，套索不落墨）
 		if (pen.kind === 'eraser' || pen.kind === 'lasso') return;
-		this.engine.applyPen(pen);
+		// 0.4.0 起走异步版：UIManager 可能在 setMode 的异步 updater 跑完前还拿不到，
+		// 同步版本会立即失败静默返回；异步版会轮询等到 um 可用再下发参数。
+		await this.engine.applyPenAsync(pen);
 	}
 
 	/** 重绘笔盒（选中态、颜色方块、粗细圆点都要跟着变）。 */

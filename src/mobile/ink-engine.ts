@@ -501,6 +501,10 @@ export class InkEngine {
 	 *
 	 * 参数 mode 取 AnnotationEditorType：NONE(0) / INK(15) / HIGHLIGHT(9)。
 	 * 传 NONE 等价于「提交并退出手写」，pdf.js 会把当前绘制会话落成编辑器。
+	 *
+	 * ⚠️ setMode 是**同步触发 + 异步落盘**。调用 `viewer.annotationEditorMode = { mode }` 时，
+	 * pdf.js 内部只是排了个 updater（NONE → 非 NONE 还要等所有页渲染完），存储值在 updater
+	 * 跑完前不会变。所以本方法返回的 `after` 可能是旧值；需要等真生效请用 setModeAsync。
 	 */
 	setMode(mode: number): InkOpResult & { before: number; after: number } {
 		const viewer = this.handle?.viewer;
@@ -521,9 +525,71 @@ export class InkEngine {
 		}
 	}
 
-	/** 进入手写模式（黑/墨迹）。 */
-	enterInk(): InkOpResult {
-		return this.setMode(this.constants?.AnnotationEditorType.INK ?? 15);
+	/**
+	 * 异步版 setMode —— 等到模式真的落盘（或超时）才返回。
+	 *
+	 * 真机反复踩到的坑：NONE → INK 时 pdf.js 走重路径，要先 toggleEditingMode 再等所有页
+	 * pagerendered，再 setTimeout(updater, 0)。updater 里才设置存储值。在这之前 getMode()
+	 * 永远返回旧值 NONE，applyPen / ensureUIManager（依赖 `getMode() !== 0` 的播种路径）
+	 * 全部静默失败 —— 用户感受是「第一次切模式没反应，再点一次才好」。
+	 *
+	 * 解决：监听 pdf.js 在 updater 末尾 dispatch 的 `annotationeditormodechanged` 事件。
+	 */
+	async setModeAsync(mode: number, timeoutMs = 1500): Promise<InkOpResult & { before: number; after: number }> {
+		const r = this.setMode(mode);
+		if (r.ok && this.getMode() === mode) return r; // 同步路径已经搞定
+		const ok = await this.waitForMode(mode, timeoutMs);
+		const after = this.getMode();
+		return { ...r, ok: ok && r.ok, after };
+	}
+
+	/**
+	 * 等到模式变成目标值（或超时返回 false）。优先用 `annotationeditormodechanged` 事件，
+	 * 没 eventBus 时退化为短间隔轮询。
+	 */
+	private waitForMode(targetMode: number, timeoutMs = 1500): Promise<boolean> {
+		if (this.getMode() === targetMode) return Promise.resolve(true);
+		const bus = this.handle?.eventBus;
+		if (!bus?.on) {
+			return new Promise((resolve) => {
+				const deadline = Date.now() + timeoutMs;
+				const tick = () => {
+					if (this.getMode() === targetMode) return resolve(true);
+					if (Date.now() > deadline) return resolve(false);
+					window.setTimeout(tick, 30);
+				};
+				tick();
+			});
+		}
+		return new Promise((resolve) => {
+			let done = false;
+			const finish = (ok: boolean) => {
+				if (done) return;
+				done = true;
+				resolve(ok);
+			};
+			const timer = window.setTimeout(() => {
+				try { bus.off?.('annotationeditormodechanged', onChanged); } catch { /* ignore */ }
+				finish(this.getMode() === targetMode);
+			}, timeoutMs);
+			const onChanged = (payload: any) => {
+				if (payload?.mode === targetMode) {
+					window.clearTimeout(timer);
+					try { bus.off?.('annotationeditormodechanged', onChanged); } catch { /* ignore */ }
+					finish(true);
+				}
+			};
+			try {
+				bus.on('annotationeditormodechanged', onChanged);
+			} catch {
+				finish(this.getMode() === targetMode);
+			}
+		});
+	}
+
+	/** 进入手写模式（黑/墨迹）—— 异步版本，等模式真落盘。 */
+	enterInk(): Promise<InkOpResult> {
+		return this.setModeAsync(this.constants?.AnnotationEditorType.INK ?? 15).then((r) => ({ ok: r.ok, error: r.error }));
 	}
 
 	/**
@@ -537,13 +603,13 @@ export class InkEngine {
 	 * 现在与 GoodNotes 同语义：荧光笔 = 钢笔调大笔触（INK 通道 + 半透明），
 	 * 渲染是一条真正的粗笔画，没有任何边框。
 	 */
-	enterMarker(): InkOpResult {
-		return this.setMode(this.constants?.AnnotationEditorType.INK ?? 15);
+	enterMarker(): Promise<InkOpResult> {
+		return this.setModeAsync(this.constants?.AnnotationEditorType.INK ?? 15).then((r) => ({ ok: r.ok, error: r.error }));
 	}
 
-	/** 退出编辑（提交当前会话）。返回 NONE 后，正在绘制的笔画会被落成编辑器。 */
-	exit(): InkOpResult {
-		return this.setMode(0);
+	/** 退出编辑（提交当前会话）。NONE 让正在绘制的笔画被落成编辑器。 */
+	exit(): Promise<InkOpResult> {
+		return this.setModeAsync(0).then((r) => ({ ok: r.ok, error: r.error }));
 	}
 
 	/**
@@ -595,10 +661,10 @@ export class InkEngine {
 	 * hasSelection 为假（消掉 ②）。两步都做完，updateParams 才只落「默认参数」，
 	 * 只影响之后的新笔迹。
 	 */
-	applyPen(pen: PenSpec): InkOpResult {
+	applyPen(pen: PenSpec): Promise<InkOpResult> {
 		const lib = this.constants;
 		const um = this.getUIManager();
-		if (!lib || !um?.updateParams) return { ok: false, error: '引擎未就绪' };
+		if (!lib || !um?.updateParams) return Promise.resolve({ ok: false, error: '引擎未就绪' });
 
 		const P = lib.AnnotationEditorParamsType;
 		try {
@@ -614,10 +680,59 @@ export class InkEngine {
 				um.updateParams(P.INK_OPACITY, pen.opacity);
 			}
 			this.currentPen = pen;
+			return Promise.resolve({ ok: true });
+		} catch (err) {
+			return Promise.resolve({ ok: false, error: err instanceof Error ? err.message : String(err) });
+		}
+	}
+
+	/**
+	 * 异步版 applyPen：先等 UIManager 就绪（初次切模式可能尚未就绪，详见 waitForMode）。
+	 *
+	 * 真机 0.4.0 反馈：首次 applyPen 拿到 null 的 um → 静默失败 → 再点一次才好。
+	 * 根因：setMode 的异步 updater 还没跑完，layer 还没建好，「播种」路径拿不到 um。
+	 * 此处用短间隔轮询（最多 1.5s）等到 um 可用或超时。UIManager 落到 this 后就不再变。
+	 */
+	async applyPenAsync(pen: PenSpec, timeoutMs = 1500): Promise<InkOpResult> {
+		const lib = this.constants;
+		if (!lib) return { ok: false, error: '引擎未就绪' };
+		const um = await this.ensureUIManagerAsync(timeoutMs);
+		if (!um?.updateParams) return { ok: false, error: 'UIManager 不可用' };
+
+		const P = lib.AnnotationEditorParamsType;
+		try {
+			if (pen.kind === 'pen' || pen.kind === 'marker') {
+				this.commit();
+				this.clearSelection(um);
+			}
+			if (pen.kind === 'pen' || pen.kind === 'marker') {
+				um.updateParams(P.INK_COLOR, pen.color);
+				um.updateParams(P.INK_THICKNESS, pen.thickness);
+				um.updateParams(P.INK_OPACITY, pen.opacity);
+			}
+			this.currentPen = pen;
 			return { ok: true };
 		} catch (err) {
 			return { ok: false, error: err instanceof Error ? err.message : String(err) };
 		}
+	}
+
+	/**
+	 * 异步拿 UIManager：短间隔轮询，等到 um 可用或超时（默认 1.5s）。
+	 * 同步版 `ensureUIManager` 在异步 updater 跑完前会立即返回 null，调用方只能拿到失败结果。
+	 */
+	ensureUIManagerAsync(timeoutMs = 1500): Promise<any> {
+		if (this.uiManager?.getEditors) return Promise.resolve(this.uiManager);
+		return new Promise((resolve) => {
+			const deadline = Date.now() + timeoutMs;
+			const tick = () => {
+				const um = this.ensureUIManager();
+				if (um?.getEditors) return resolve(um);
+				if (Date.now() > deadline) return resolve(this.uiManager ?? null);
+				window.setTimeout(tick, 40);
+			};
+			tick();
+		});
 	}
 
 	/**

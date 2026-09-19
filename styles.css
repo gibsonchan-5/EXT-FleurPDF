@@ -1049,6 +1049,11 @@
 
 .fleur-context-item svg {
   display: block;
+  /* 与笔盒同源问题：Obsidian app.css 的 svg.svg-icon{width:var(--icon-size)} 在移动端
+     WebView 不可靠（背景同一根因）。这里给 .fleur-context-item 内联 SVG 显式尺寸。 */
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
 }
 
 .fleur-context-sep {
@@ -1519,6 +1524,27 @@ body.fleur-pdf-mobile .fleur-pdf-erase-rect {
   background-color: color-mix(in srgb, var(--interactive-accent) 8%, transparent);
 }
 
+/* 套索圈选的实时虚线（fixed 全屏 SVG，pointer-events:none）。
+   真机 0.4.0 反馈「圈选时看不见套索领域」—— 本类此前完全没有 CSS 规则，
+   SVG 没有尺寸被压成 0×0。给到与页面等大的画布 + 虚线 stroke。 */
+body.fleur-pdf-mobile .fleur-pdf-lasso-overlay {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 998;
+  pointer-events: none;
+  overflow: visible;
+}
+body.fleur-pdf-mobile .fleur-pdf-lasso-overlay path {
+  fill: color-mix(in srgb, var(--interactive-accent) 12%, transparent);
+  stroke: var(--interactive-accent);
+  stroke-width: 2;
+  stroke-dasharray: 6 4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 /* ── 手写模式下的画面调整 ── */
 
 /* 原生 editToolbar 整块让位给自建笔盒，避免两套 UI 叠在一起。
@@ -1539,13 +1565,17 @@ body.fleur-pdf-mobile.fleur-pdf-ink-active .textLayer {
   -webkit-user-select: none;
 }
 
-/* ── 大小滑块（0.3.0：替代固定档位圆点） ── */
+/* ── 大小滑块（0.3.0：替代固定档位圆点） ──
+   0.4.0 小米平板反馈「滑块没有居中」：原 .row 用 align-items: center 但 row 自己是
+   flex 子元素被父列拉伸到 pop 全宽，slider 顶左 + 数值顶右 → 视觉重心偏左。
+   改为列向堆叠：滑块占满宽度在上，数值在下居中 —— 重心稳。 */
 body.fleur-pdf-mobile .fleur-pdf-ink-slider-row {
   display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 2px 8px;
-  min-width: 216px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 6px 12px 8px;
+  min-width: 220px;
 }
 
 body.fleur-pdf-mobile .fleur-pdf-ink-slider {
@@ -1572,7 +1602,8 @@ body.fleur-pdf-mobile .fleur-pdf-ink-slider::-webkit-slider-thumb {
   appearance: none;
   width: 20px;
   height: 20px;
-  margin-top: -8px;
+  /* 把 thumb 视觉上拉到与 4px 轨道垂直居中（slider 高 22、轨道顶 9、thumb 高 20 → 顶 1） */
+  margin-top: 1px;
   border: none;
   border-radius: 50%;
   background: var(--interactive-accent);
@@ -1594,8 +1625,7 @@ body.fleur-pdf-mobile .fleur-pdf-ink-slider::-moz-range-thumb {
 }
 
 body.fleur-pdf-mobile .fleur-pdf-ink-slider-val {
-  min-width: 28px;
-  text-align: right;
+  text-align: center;
   font-size: 12px;
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
