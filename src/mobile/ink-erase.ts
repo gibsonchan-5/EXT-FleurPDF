@@ -27,7 +27,7 @@
 //
 // 三种模式共用同一套「删旧 → deserialize 重建 → layer.add」的契约重建流程。
 
-import { readInkGeometry, stripInkIdentity, type InkEngine } from './ink-engine';
+import { mintStrokeId, readInkGeometry, stripInkIdentity, type InkEngine } from './ink-engine';
 
 /** PDF 用户空间坐标（原点左下，与 serialize() 的 lines 同一坐标系）。 */
 export interface PdfPoint {
@@ -477,6 +477,9 @@ export async function eraseAtPoint(
 		try {
 			const rebuilt = await Editor.deserialize(rebuiltData, layer, um);
 			if (rebuilt) {
+				// ★ 必须补 id：见 ink-engine 的 strokeId 长注释。缺了它，多次重建会把彼此
+				// 从 UIManager 的编辑器表里挤掉（共用 undefined 键），结局是「擦一笔，别的笔迹跟着消失」。
+				rebuilt.id = mintStrokeId();
 				try {
 					// 必须走 layer.add()：AnnotationStorage 的写入在它内部完成
 					// （um.addEditor() 只把编辑器登记进 #allEditors，不落存储 —— 实测踩过）。
@@ -587,6 +590,9 @@ export async function eraseInRect(
 		try {
 			const rebuilt = await Editor.deserialize(rebuiltData, layer, um);
 			if (rebuilt) {
+				// ★ 必须补 id：见 ink-engine 的 strokeId 长注释。缺了它，多次重建会把彼此
+				// 从 UIManager 的编辑器表里挤掉（共用 undefined 键），结局是「擦一笔，别的笔迹跟着消失」。
+				rebuilt.id = mintStrokeId();
 				try {
 					layer.add(rebuilt);
 				} catch {

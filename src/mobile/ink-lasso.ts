@@ -16,7 +16,7 @@
 // 坐标系备忘：serialize() 的 lines 用 PDF 用户空间（原点左下，y 向上），
 // DOM 是原点左上。屏幕向右下拖动 (dxPx, dyPx) ⇒ PDF 位移 (+dxPx/scale, -dyPx/scale)。
 
-import { readInkGeometry, stripInkIdentity, type InkEngine } from './ink-engine';
+import { mintStrokeId, readInkGeometry, stripInkIdentity, type InkEngine } from './ink-engine';
 import { toPdfPoint, type PdfPoint } from './ink-erase';
 
 /** 视口坐标点。 */
@@ -206,6 +206,9 @@ export async function moveEditorBy(
 	try {
 		const rebuilt = await Editor.deserialize(rebuiltData, layer, um);
 		if (rebuilt) {
+			// ★ 必须补 id：见 ink-engine 的 strokeId 长注释。缺了它，多次重建会把彼此
+			// 从 UIManager 的编辑器表里挤掉（共用 undefined 键），结局是「擦一笔，别的笔迹跟着消失」。
+			rebuilt.id = mintStrokeId();
 			try {
 				layer.add(rebuilt);
 			} catch {

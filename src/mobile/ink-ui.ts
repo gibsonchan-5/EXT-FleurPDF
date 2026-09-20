@@ -10,12 +10,12 @@
 //   因此这里用「双指手势接管」：捕获阶段拦下第二个触点，取消已起手的绘制，
 //   然后自己驱动滚动。这比让用户「退出手写再滚」顺手得多。
 
-import { Notice, setIcon } from 'obsidian';
+import { Notice, setIcon, type TFile } from 'obsidian';
 import type FleurPDFPlugin from '../main';
 import type { InkEngine, PenSpec } from './ink-engine';
 import { eraseAtPoint, eraseInRect, toPdfPoint, type EraseMode } from './ink-erase';
 import { lassoHitEditors, lassoPolyToPdf, moveEditorBy, screenBBoxOfEditors, type ScreenPoint } from './ink-lasso';
-import { InkStorage } from './ink-storage';
+import { InkStore, type InkEntry, type InkSidecar } from './ink-store';
 
 /**
  * PDF 视图的类名候选（仅作最后兜底）。
@@ -66,21 +66,16 @@ const SIZE_RANGE: Record<PenSpec['kind'], [number, number, number]> = {
 };
 
 /**
- * 空闲自动落盘的防抖时长（ms）。
- *
- * 写回 PDF 是重操作（重新序列化整份 PDF + 先备份原文件 + 原地改写），
- * 对几十 MB 的 PDF 是百毫秒级的活；太短会反复重写，太长则「关掉 App 时」
- * 丢的内容多。12 秒是「一笔一停手就看得到结果」与「不折腾磁盘」的折中。
- */
-/**
  * 停笔后多久静默落盘一次。
  *
- * 从 12s 收紧到 4s：12s 太长，「写完一笔立刻关文件」的用户根本等不到，
- * 而关闭时的兜底落盘一旦赶在视图销毁之后就注定失败（真机 0.4.1 的误报就出在这里）。
- * 4s 是「用户极少在 4 秒内完成落笔→关闭」与「不频繁重写 PDF」之间的折中；
- * 写盘本身有互斥 + 防抖，连续落笔不会叠加写盘次数。
+ * ⚠️ 0.5 起落盘对象变了：**写插件自己的 JSON，不再写回 PDF**（见 ink-store.ts 的架构说明）。
+ * 这一步很轻（几 KB 的 JSON，不重新序列化整份 PDF、不改写用户文件），
+ * 所以从 4s 收紧到 1.5s —— 用户几乎不可能在 1.5 秒内完成「落笔 → 关闭文件」。
+ *
+ * 关键收益：写 JSON **不触碰 PDF**，Obsidian 不会因此销毁重建视图，
+ * 也就不会出现「写回后内存里未写回的笔迹全丢」（真机反复反馈的掉笔迹）。
  */
-const AUTO_SAVE_IDLE_MS = 4000;
+const AUTO_SAVE_IDLE_MS = 1500;
 
 /** 擦除模式的展示名。 */
 const ERASE_MODE_LABEL: Record<EraseMode, string> = {
@@ -108,6 +103,8 @@ export class InkUI {
 	/** 双态切换器的两段：编辑 / 手写。 */
 	private editSeg: HTMLElement | null = null;
 	private inkSeg: HTMLElement | null = null;
+	/** 第三段：批注列表（打开文本批注侧边栏）。 */
+	private sideSeg: HTMLElement | null = null;
 	private penBar: HTMLElement | null = null;
 	private scrollHost: HTMLElement | null = null;
 	private detachTwoFinger: (() => void) | null = null;
@@ -122,11 +119,31 @@ export class InkUI {
 	private readonly pens: PenSpec[];
 	/** 当前擦除模式（仅橡皮笔生效，0.2.0 起持久化）。 */
 	private eraserMode: EraseMode;
-	/** 手写模式激活期间是否只允许笔输入（真机笔 vs 手指）。 */
-	private readonly storage: InkStorage;
+	/** 笔迹的 sidecar 存储 —— 方案 C 的真相源（见 ink-store.ts 的架构说明）。 */
+	private readonly inkStore: InkStore;
+	/** 上次落盘的内容指纹（JSON 字符串），用于判断「是否真有新内容要存」。 */
+	private lastSavedJson = '';
+	/**
+	 * 内存快照：最近一次「编辑器里有什么」以及它属于哪个文件。
+	 *
+	 * 存在的唯一理由：PDF 视图被销毁后，pdf.js 的编辑器对象随之消失，此时再调
+	 * exportStrokeEntries() 只会拿到空数组 —— 而「写完直接关文件」正是最自然的
+	 * 操作路径，最后那一两笔会变成孤儿（真机反复反馈的「掉笔迹」）。
+	 * 快照在每个改动点同步刷新（见 scheduleAutoSave），视图死掉后仍可补写进
+	 * sidecar（见 salvageSnapshot）。
+	 */
+	private lastFile: TFile | null = null;
+	private lastEntries: InkEntry[] | null = null;
+	/**
+	 * 已接管过的固有注释 id 全集（只增不减），随每次落盘写回 sidecar。
+	 *
+	 * ⚠️ 每次 save 都必须把它带上：落盘是**整份覆盖**，漏传就等于把认领名单清空，
+	 * 用户擦掉的笔迹会在下次进入时从 PDF 原件里复活。
+	 */
+	private claimedIds = new Set<string>();
 	/** 空闲自动落盘的防抖计时器（见 autoSave）。 */
 	private autoSaveTimer: number | null = null;
-	/** 写盘互斥：写回 PDF 是重操作，同一时刻只允许一个在跑。 */
+	/** 落盘互斥：避免自动落盘与显式保存叠加。 */
 	private saving = false;
 	/** 本会话是否已提示过保存失败（自动保存的失败多为视图切换途中的一次性错误，避免刷屏）。 */
 	private saveErrorNotified = false;
@@ -135,7 +152,7 @@ export class InkUI {
 		private plugin: FleurPDFPlugin,
 		private engine: InkEngine,
 	) {
-		this.storage = new InkStorage(plugin.app);
+		this.inkStore = new InkStore(plugin.app);
 		this.pens = InkUI.loadPens(plugin);
 		this.eraserMode = plugin.settings.inkEraserMode ?? 'stroke';
 	}
@@ -205,7 +222,10 @@ export class InkUI {
 		inkBtn.addEventListener('click', (e) => {
 			e.preventDefault();
 			e.stopPropagation();
-			if (!this.active) void this.enterInk();
+			// 再点一次即退出：这样即便用户在设置里关掉了「编辑」段，
+			// 也仍有路走出写模式，不会被困住。
+			if (this.active) void this.exitInk();
+			else void this.enterInk();
 		});
 
 		// 第三段：批注列表（原「双态」扩为三态）。
@@ -223,8 +243,10 @@ export class InkUI {
 
 		this.editSeg = editBtn;
 		this.inkSeg = inkBtn;
+		this.sideSeg = sideBtn;
 		this.toggleBtn = sw;
 		this.syncSwitcher();
+		this.syncSwitcherVisibility();
 
 		// 位置恢复（上次拖到哪就回到哪）+ 拖动换位 + 长按收起
 		this.applySwitcherPos();
@@ -259,10 +281,70 @@ export class InkUI {
 		document.addEventListener('visibilitychange', this.onHiddenFlush);
 		window.addEventListener('pagehide', this.onHiddenFlush);
 
-		// M3-A：首次挂载给一条指引入口在哪（只在本会话第一次出现）。
-		// 带上版本号：真机排查时「到底装没装上这一版」是最先要确认的事，
-		// 之前就吃过 BRAT 未更新却在排查已修问题的亏。
-		if (!InkUI.mountHintShown) {
+		// ── 按当前视图同步悬浮胶囊的显隐 ──
+		// 胶囊挂在 body 上，原本与「当前打开的是什么文件」无关，于是在普通笔记里
+		// 也照常浮着 —— 真机反馈「全局都显示很碍眼」。
+		// file-open 覆盖「换文件」，active-leaf-change 覆盖「切标签页 / 切到设置页」，
+		// 两条都挂才不会有残留。
+		this.plugin.registerEvent(
+			this.plugin.app.workspace.on('active-leaf-change', () => this.syncSwitcherVisibility()),
+		);
+		this.plugin.registerEvent(
+			this.plugin.app.workspace.on('file-open', () => this.syncSwitcherVisibility()),
+		);
+	}
+
+	/** 同步切换器的高亮（编辑段 / 手写段互斥）。 */
+	private syncSwitcher(): void {
+		this.editSeg?.toggleClass('is-active', !this.active);
+		this.inkSeg?.toggleClass('is-active', this.active);
+	}
+
+	/* ==================== 悬浮切换器：显隐 ==================== */
+
+	/**
+	 * 当前视图是不是在 PDF 上。
+	 *
+	 * 只认活动文件的扩展名：PDF 阅读视图 / 新窗口打开都如实反映在 getActiveFile() 上，
+	 * 比去猜 leaf 的 view 类型稳（pdf.js 的视图类没有稳定的公开类型名）。
+	 */
+	private isPdfContext(): boolean {
+		try {
+			return this.plugin.app.workspace.getActiveFile()?.extension === 'pdf';
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * 同步悬浮胶囊（含三段）的显隐。设置里改开关、切换文件、切换标签页都会走到这里。
+	 *
+	 * 判定顺序：
+	 *   ① 用户在设置里关掉了 → 整颗隐藏；
+	 *   ② 当前不在 PDF 视图 → 整颗隐藏（「全局都显示很碍眼」的根治）；
+	 *   ③ 三段各自的开关 → 逐段隐藏；
+	 *   ④ 三段都被关掉 → 整颗隐藏（否则只剩一个空壳，比不显示更碍眼）。
+	 */
+	syncSwitcherVisibility(): void {
+		const sw = this.toggleBtn;
+		if (!sw) return;
+		const s = this.plugin.settings;
+
+		const showEdit = s.inkShowEditSeg !== false;
+		const showInk = s.inkShowInkSeg !== false;
+		const showSide = s.inkShowSideSeg !== false;
+		const anySeg = showEdit || showInk || showSide;
+
+		const hidden = s.inkSwitcherHidden === true || !this.isPdfContext() || !anySeg;
+		sw.toggleClass('is-hidden', hidden);
+
+		this.editSeg?.toggleClass('is-hidden', !showEdit);
+		this.inkSeg?.toggleClass('is-hidden', !showInk);
+		this.sideSeg?.toggleClass('is-hidden', !showSide);
+
+		// 指引只在按钮**真的出现**时给一次。原先挂在 mount 上，用户若正好停在
+		// 普通笔记里，提示会指向一颗看不见的按钮。
+		if (!hidden && !InkUI.mountHintShown) {
 			InkUI.mountHintShown = true;
 			new Notice(
 				`FleurPDF 手写批注已就绪 v${ this.plugin.manifest.version }：点击右下角的“手写”按钮开始批注`,
@@ -270,10 +352,10 @@ export class InkUI {
 		}
 	}
 
-	/** 同步切换器的高亮（编辑段 / 手写段互斥）。 */
-	private syncSwitcher(): void {
-		this.editSeg?.toggleClass('is-active', !this.active);
-		this.inkSeg?.toggleClass('is-active', this.active);
+	/** 供外部（设置页改开关后）刷新显隐。 */
+	refreshVisibility(): void {
+		this.syncSwitcherVisibility();
+		this.applySwitcherPos();
 	}
 
 	/* ==================== 悬浮切换器：拖动 / 收起 ==================== */
@@ -423,13 +505,41 @@ export class InkUI {
 		void this.plugin.saveSettings().catch(() => undefined);
 		this.toggleBtn?.toggleClass('is-collapsed', collapsed);
 		if (collapsed) {
-			new Notice('悬浮按钮已收起：点侧边的小把手即可恢复，也可用命令面板的「显示/收起手写批注悬浮按钮」');
+			new Notice('悬浮按钮已收起：点侧边的小把手即可恢复，也可用命令面板的「显示 / 隐藏手写批注悬浮按钮」');
 		}
 	}
 
-	/** 供命令面板调用：显示 / 收起悬浮胶囊（用户彻底找不到入口时的兜底）。 */
+	/**
+	 * 供命令面板调用：显示 / 隐藏悬浮胶囊（用户彻底找不到入口时的兜底）。
+	 *
+	 * 状态是两层的（收起 / 隐藏），命令一次只推进一步，且优先级是
+	 * 「先恢复可见，再谈收起」—— 用户敲这条命令时想的一定是「让我看见它」。
+	 */
 	toggleSwitcher(): void {
-		this.setSwitcherCollapsed(this.plugin.settings.inkSwitcherCollapsed !== true);
+		const s = this.plugin.settings;
+
+		if (s.inkSwitcherHidden === true) {
+			s.inkSwitcherHidden = false;
+			s.inkSwitcherCollapsed = false;
+			void this.plugin.saveSettings().catch(() => undefined);
+			this.toggleBtn?.removeClass('is-collapsed');
+			this.syncSwitcherVisibility();
+			new Notice('已显示手写批注悬浮按钮');
+			return;
+		}
+		if (s.inkSwitcherCollapsed === true) {
+			this.setSwitcherCollapsed(false);
+			return;
+		}
+		// 手写模式中不留无按钮的死角：先退出手写，用户就不必自己找出口
+		if (this.active) {
+			new Notice('请先退出手写模式，再隐藏悬浮按钮');
+			return;
+		}
+		s.inkSwitcherHidden = true;
+		void this.plugin.saveSettings().catch(() => undefined);
+		this.syncSwitcherVisibility();
+		new Notice('已隐藏悬浮按钮：可用命令面板或设置里的「显示悬浮按钮」重新打开');
 	}
 
 	unmount(): void {
@@ -444,6 +554,7 @@ export class InkUI {
 		this.toggleBtn = null;
 		this.editSeg = null;
 		this.inkSeg = null;
+		this.sideSeg = null;
 	}
 
 	/** 点空白处收起「颜色/粗细」展开面板（笔盒本身不收起）。 */
@@ -498,6 +609,17 @@ export class InkUI {
 			new Notice(`手写模式不可用：${res.error}`);
 			return;
 		}
+
+		// 归零上一次进入留下的编辑器（pdf.js 退出编辑模式不会销毁它们）。
+		// 放在这里而不是 restoreInkFromStore 里：那个函数是延迟 300ms 才跑的，
+		// 而用户在 300ms 内落笔是理论上可能的 —— 那时清空会正好删掉他刚画的那一笔。
+		// 此刻 enterInk 刚起步，用户不可能已经在画，是唯一无竞态的清空时机。
+		try {
+			const cleared = this.engine.clearInkEditors();
+			if (cleared) console.log(`[FleurPDF Ink] 清理上一轮残留编辑器 ${cleared} 个`);
+		} catch {
+			/* 清不掉最多是重影，不影响后面的重建 */
+		}
 		if (!res.ok) {
 			console.warn(
 				'[FleurPDF Ink] 进入手写模式未在超时内确认，继续挂载 UI 并延迟重试：',
@@ -532,73 +654,108 @@ export class InkUI {
 			new Notice('手写已开启，但当前 PDF 视图的批注接口不可用：可书写，笔色 / 橡皮 / 撤销暂不可用');
 		} else {
 			this.umMissing = false;
-			// 固有笔迹播种：重开文件后，写回过的笔迹是文件里的 /Ink 注释，
-			// 正常应由 pdf.js 在进入编辑模式时转成编辑器（真机 0.4.2 实测这条
-			// 转换在移动端没有生效 —— 表现为历史笔迹擦不掉、套索圈不中）。
-			// 这里主动补建，只补缺失的，pdf.js 已转成功的会被去重跳过。
+			// 恢复历史笔迹 —— 方案 C 的读端（见 restoreInkFromStore）。
+			//
+			// 这里刻意**不依赖**「注释层是否已渲染完」：0.4.4 之所以失败，正是因为
+			// 播种走的是 pdf.js 的固有注释转换链路，而那条链路要求注释元素先挂上 DOM，
+			// 时机不可控且只试一次。现在的数据来自插件自己的 JSON，与注释渲染无关。
+			// 300ms 只是给编辑层挂上 DOM 的宽限（deserialize 需要 layer.viewport 就绪）。
 			window.setTimeout(() => {
-				if (this.active) void this.seedExistingInkEditors();
-			}, 450);
+				if (this.active) void this.restoreInkFromStore();
+			}, 300);
 		}
 	}
 
 	/**
-	 * 把文件固有的手写笔迹补建为编辑器（擦除 / 套索 / 移动都以编辑器为操作对象）。
+	 * 恢复历史笔迹 —— 方案 C 的读端。
 	 *
-	 * 复用 pdf.js 自己的转换链路：注释层 getEditableAnnotations() →
-	 * 编辑器层 deserialize()（内部就是 InkEditor.deserialize 对 InkAnnotationElement
-	 * 的那条路，与 enable() 的原生转换一字不差）。任何一页失败都不影响其余页。
+	 * 三段职责，顺序不能换：
+	 *   ① **接管**：把 PDF 里既有的固有 `/Ink` 注释（0.4.x 写回去的老数据）转成
+	 *      我们自己的数据。增量、可重入 —— pdf.js 只渲染视口附近的页，注释层是
+	 *      按需出现的，一次全量扫描必然漏，所以每次进入都补扫一遍。
+	 *   ② **重建**：从数据建出编辑器。重建出来的编辑器不带 `annotationElementId`，
+	 *      pdf.js 视其为「本次会话新画的」，`serialize()` 永远正常返回 —— 这是
+	 *      「不论关闭重开，历史笔迹都能擦」的根基。
+	 *   ③ **隐藏原件**：PDF 里那些被接管过的注释仍在（我们不改写用户文件），
+	 *      不藏起来就会与重建体叠成双影，而且它们擦不掉（固有编辑器 serialize() 恒 null）。
+	 *
+	 * 隐藏规则有两档，刻意不对称：
+	 *   · 以前接管过的（记录在 sidecar.claimedIds）**无条件继续隐藏** —— 哪怕对应
+	 *     的 entry 已经被用户擦掉了。那正是「擦掉」的含义：原件还在 PDF 里，不藏就复活。
+	 *   · 本轮新接管的只隐藏**确实重建成功**的那些 —— 万一数据坏了建不出来，
+	 *     把原件也藏掉就等于笔迹凭空消失，比看得见但擦不掉更糟。
 	 */
-	private async seedExistingInkEditors(): Promise<void> {
+	private async restoreInkFromStore(): Promise<void> {
+		const file = this.engine.getFile();
+		if (!file) return;
+		// 换文件后基线必须作废：否则新文件的第一笔会拿旧文件的指纹比对，被误判成「没变化」
+		this.lastSavedJson = '';
+		this.lastFile = file;
+		this.lastEntries = null;
+
+		let sidecar: InkSidecar | null = null;
 		try {
-			const um = this.engine.getUIManager();
-			if (!um) return;
-			let seeded = 0;
-			for (let pi = 0; pi < this.engine.pageCount; pi++) {
-				const editorLayer = this.engine.getLayer(pi);
-				const annLayer = this.engine.getAnnotationLayer(pi);
-				if (!editorLayer || !annLayer?.getEditableAnnotations) continue;
-
-				// 去重：pdf.js 原生转换已建过的编辑器带 annotationElementId，
-				// 与固有注释的 data.id 一一对应，出现即说明该注释已可编辑。
-				const have = new Set(
-					this.engine
-						.getEditors(pi)
-						.map((e: any) => e?.annotationElementId)
-						.filter(Boolean),
-				);
-
-				for (const el of annLayer.getEditableAnnotations()) {
-					const data = el?.data;
-					if (!data || data.subtype !== 'Ink' || !data.id) continue;
-					if (have.has(data.id)) continue;
-					let editor: any = null;
-					try {
-						// 编辑器层公开方法，内部即 InkEditor.deserialize(el, layer, um)
-						editor = await (editorLayer as any).deserialize(el);
-					} catch {
-						continue;
-					}
-					if (!editor) continue;
-					try {
-						(editorLayer as any).add(editor);
-						editor.enableEditing?.();
-						seeded++;
-					} catch {
-						try {
-							um.addEditor(editor);
-							seeded++;
-						} catch {
-							/* 单个失败不影响其余 */
-						}
-					}
-				}
-			}
-			if (seeded > 0) {
-				console.log(`[FleurPDF Ink] 固有手写笔迹已补建为可编辑对象：${seeded} 条`);
-			}
+			sidecar = await this.inkStore.load(file);
 		} catch (err) {
-			console.warn('[FleurPDF Ink] 固有笔迹播种失败（不影响书写）:', err);
+			console.warn('[FleurPDF Ink] 读取手写数据失败（不影响新书写）:', err);
+		}
+
+		// 归零动作在 enterInk 里已经做完（见那里的注释），此处只负责读与建。
+
+		let entries: InkEntry[] = sidecar?.entries ? [...sidecar.entries] : [];
+		const previouslyClaimed = new Set<string>(sidecar?.claimedIds ?? []);
+
+		// ── ① 增量接管 ──
+		const skip = new Set<string>(previouslyClaimed);
+		for (const e of entries) if (e.sourceId) skip.add(e.sourceId);
+		let newlyClaimed: InkEntry[] = [];
+		try {
+			newlyClaimed = await this.engine.claimInherentInk(skip);
+		} catch (err) {
+			console.warn('[FleurPDF Ink] 接管固有笔迹失败（下一轮重试）:', err);
+		}
+		if (newlyClaimed.length) {
+			entries = entries.concat(newlyClaimed);
+			console.log(`[FleurPDF Ink] 新接管 PDF 固有手写笔迹 ${newlyClaimed.length} 条`);
+		}
+
+		// ── ② 重建 ──
+		let restored = new Set<string>();
+		if (entries.length) {
+			try {
+				restored = await this.engine.restoreStrokeEntries(entries);
+				if (restored.size || entries.length) {
+					console.log(`[FleurPDF Ink] 已恢复手写笔迹 ${entries.length} 条`);
+				}
+			} catch (err) {
+				console.warn('[FleurPDF Ink] 恢复手写笔迹失败（不影响新书写）:', err);
+			}
+		}
+
+		// ── ③ 隐藏原件 ──
+		const hide = new Set<string>(previouslyClaimed);
+		for (const e of newlyClaimed) {
+			if (e.sourceId && restored.has(e.sourceId)) hide.add(e.sourceId);
+		}
+		if (hide.size) {
+			try {
+				this.engine.hideInherentInk(hide);
+			} catch {
+				/* 隐藏失败最多是重影，不影响可擦性 */
+			}
+		}
+
+		// ── 落盘：条目 + 认领名单 ──
+		// 认领名单必须落盘且只增不减（见 ink-store.ts 的 claimedIds 注释）。
+		// 本轮新认领但没建成功的**不入册**，留给下一轮重试。
+		const claimedIds = Array.from(hide);
+		this.claimedIds = hide;
+		this.lastSavedJson = JSON.stringify(entries);
+		this.lastEntries = entries;
+		try {
+			await this.inkStore.save(file, entries, claimedIds);
+		} catch (err) {
+			console.warn('[FleurPDF Ink] 写入手写数据失败（不影响新书写）:', err);
 		}
 	}
 
@@ -629,84 +786,89 @@ export class InkUI {
 		this.persist();
 	}
 
-	/** 笔盒上的保存钮：显式写回 PDF。 */
+	/** 笔盒上的保存钮：显式落盘。 */
 	private async save(): Promise<void> {
 		this.cancelAutoSave();
-		const wrote = await this.autoSave(false);
-		// 文件已被改写：退出编辑态，避免继续在旧的内存文档上落墨
-		if (wrote) await this.exitInk();
+		// 不再退出编辑态：落盘只写插件自己的 JSON、不改动 PDF 文件，
+		// 内存里的编辑器依然有效，用户可以接着写。
+		// （0.4.x 之所以写完就退出，是因为写回 PDF 会改写文件、旧文档句柄随即失效。）
+		await this.autoSave(false);
 	}
 
 	/* ============================ 自动落盘 ============================ */
 
 	/**
-	 * 把内存中的手写批注写回 PDF。
+	 * 把手写批注落盘。
 	 *
-	 * 真机 0.4.0 的「批注之后关闭文件、重新回来全没了」就出在这里：
-	 * 批注此前只存在于 pdf.js 的 AnnotationStorage（纯内存），唯一出口是笔盒上的
-	 * 保存钮 —— 而「写完直接关文件」才是最自然的用法，所以必然丢数据。
+	 * ⚠️ 0.5 起落盘目标是**插件自己的 JSON**，不再是 PDF 文件（见 ink-store.ts）。
+	 * 这是纯数据写入：不改写用户文件、不重新序列化 PDF、**不会让 Obsidian 重载视图** ——
+	 * 因此不会出现「写回后内存里尚未写回的笔迹全丢」。
 	 *
-	 * 三层保障：
-	 *   ① 每次落笔 / 擦除 / 套索改动后，空闲 AUTO_SAVE_IDLE_MS 静默写回 ——
+	 * 三层保障（与 0.4.x 相同，只是落盘对象换了）：
+	 *   ① 每次落笔 / 擦除 / 套索改动后，空闲 AUTO_SAVE_IDLE_MS 静默落盘 ——
 	 *      兜住「不点保存直接杀掉 App」；
-	 *   ② 退出手写模式（点 ✓）时立刻写回（exitInk）；
-	 *   ③ 切换文件 / 工作区布局变化时兜底写回（flushBeforeLeave）。
+	 *   ② 退出手写模式（点 ✓）时立刻落盘（exitInk）；
+	 *   ③ 切换文件 / 工作区布局变化时兜底落盘（flushBeforeLeave）。
 	 *
 	 * @param silent 静默模式：无内容可存时不提示，成功也不提示（失败仍会提示）。
-	 * @returns 是否真的写回了文件。
+	 * @returns 是否真的写出了新内容。
 	 */
 	private async autoSave(silent: boolean): Promise<boolean> {
 		if (this.saving) {
-			// 写盘进行中：静默模式下直接跳过（下一次改动会重新排队），
+			// 落盘进行中：静默模式下直接跳过（下一次改动会重新排队），
 			// 显式点保存则要告诉用户「不是没保存，是正在保存」
 			if (!silent) new Notice('正在保存手写批注，请稍候');
 			return false;
 		}
 		this.saving = true;
 		try {
-			// 视图已被销毁（关闭文件 / 切标签页）→ 没有可写回的目标了。
-			// 此时必须静默复位：真机 0.4.1 的误报「手写批注保存失败：没有可写回的
-			// 手写批注」就是拿已销毁的 handle 继续导出造成的。顺带把 active 复位，
-			// 否则后续每次 file-open / layout-change 都会再撞一次同样的墙。
+			// 视图已被销毁（关闭文件 / 切标签页）→ 编辑器对象已经没了，
+			// 但最后一次内存快照还在手上，用它补一次盘再复位。
+			// 顺序很重要：salvageSnapshot 必须跑在 resetInkStateIfDead 之前 ——
+			// reset 会把 active / lastSavedJson 一起清掉。
 			if (!this.engine.isHandleAlive) {
+				const salvaged = await this.salvageSnapshot();
 				this.resetInkStateIfDead();
-				return false;
+				return salvaged;
 			}
 
-			// 提交当前绘制会话，否则最后一笔还不在存储里
+			// 提交当前绘制会话，否则最后一笔还没成为独立编辑器
 			this.engine.commit();
 			// commit() 是同步接口，但落进 AnnotationStorage 要等一拍（见 ink-engine 陷阱 4）
 			await new Promise((r) => window.setTimeout(r, 60));
 
-			if (!this.engine.hasUnsaved) {
+			const file = this.engine.getFile();
+			if (!file) {
+				if (!silent) new Notice('找不到对应的 PDF 文件，无法保存手写批注');
+				return false;
+			}
+			// 记下归属，供视图被销毁后的 salvageSnapshot 使用
+			this.lastFile = file;
+
+			const entries = this.engine.exportStrokeEntries();
+			const json = JSON.stringify(entries);
+			// 内容没变就不写。替代原先的 `engine.hasUnsaved`（那是 PDF 的 dirty 标志，
+			// 语义已不适用）。用内容指纹而不是条数：擦一笔再画一笔，条数可能完全相同。
+			if (json === this.lastSavedJson) {
+				this.lastEntries = entries;
 				if (!silent) new Notice('当前没有需要保存的手写批注');
 				return false;
 			}
-			const file = this.engine.getFile();
-			if (!file) {
-				new Notice('找不到对应的 PDF 文件，无法保存手写批注');
-				return false;
-			}
 
-			const out = await this.storage.saveAnnotated(this.engine, file);
-			if (out.ok) {
-				if (!silent) new Notice(`已写入手写批注（${Math.round((out.bytes ?? 0) / 1024)} KB）`);
-				// 写回改动了 vault 里的文件，Obsidian 可能随即重载 PDF 视图（旧 handle
-				// 被销毁）。若不重连，用户继续画的每一笔都落在死 handle 上 —— 重开
-				// 文件时全部丢失，只剩这一次写回的内容（真机 0.4.2 的「只存开头几笔」）。
-				void this.reattachIfReloaded();
-				return true;
-			}
-			// 没有内容可写回 = 正常路径（视图刚被销毁、或本来就还没落墨），不提示。
-			// 这条曾经是「关闭文件后弹一堆保存失败」的元凶：正常情况被当成错误报了。
-			if (out.reason === 'empty') return false;
-
-			// 真失败（IO / 文件被占用）必须让用户知道 —— 静默失败会变成「批注又没了」。
-			// 但自动保存的失败多半是「视图正在切换途中」这类一次性的，
+			await this.inkStore.save(file, entries, Array.from(this.claimedIds));
+			this.lastSavedJson = json;
+			this.lastEntries = entries;
+			// 全程不触碰 PDF 文件 ⇒ Obsidian 不会重载视图 ⇒ 既不需要重连 handle，
+			// 也不会出现「重载后内存里未写回的笔迹全丢」（真机反复反馈的掉笔迹）。
+			if (!silent) new Notice(`已保存手写批注（${entries.length} 条）`);
+			return true;
+		} catch (err) {
+			// 真失败（磁盘 / 权限）必须让用户知道 —— 静默失败会变成「批注又没了」。
+			// 但自动落盘的失败多半是「视图正在切换途中」这类一次性的，
 			// 每次都弹会变成噪音，所以每个会话只提示一次。
 			if (!silent || !this.saveErrorNotified) {
 				this.saveErrorNotified = true;
-				new Notice(`手写批注保存失败：${out.error ?? '未知原因'}`);
+				new Notice(`手写批注保存失败：${err instanceof Error ? err.message : String(err)}`);
 			}
 			return false;
 		} finally {
@@ -719,45 +881,21 @@ export class InkUI {
 	 *
 	 * 关闭文件不会走 exitInk（用户没点「完成」），于是 active 一直留在 true、
 	 * engine 也还攥着旧 handle。复位后悬浮切换器回到「编辑」态、笔盒收起，
-	 * 后续的 file-open / layout-change 不会再拿幽灵 handle 去做无意义的导出。
-	 */
-	/**
-	 * 视图被 Obsidian 重载后的「热重连」。
+	 * 后续的 file-open / layout-change 不会再拿幽灵 handle 去做无意义的落盘。
 	 *
-	 * 背景：autoSave 写回 PDF 后，Obsidian 检测到文件变化可能销毁并重建 PDF 视图。
-	 * 此时 engine 的 handle 指向死对象 —— 用户的手指还在屏幕上，但输入路由、
-	 * 笔盒都挂在旧 DOM 上，之后画的每一笔都不会进入新文档。
-	 *
-	 * 处理：按 enterInk 的同一条路径重新 resolve → 进编辑模式 → 重挂输入。
-	 * handle 还活着（Obsidian 没重载）时什么都不做，零开销。
+	 * ⚠️ 0.5 起**不再需要** 0.4.x 的 `reattachIfReloaded`（热重连）：
+	 * 那条路径是为「写回 PDF ⇒ 触发视图重载 ⇒ 旧 handle 变死」准备的。现在落盘
+	 * 只写插件自己的 JSON、完全不碰 PDF，视图不会被我们自己搞重载；而笔迹的真相源
+	 * 就在 JSON 里 —— 即便视图因外部原因（别的程序改了文件、同步回传）被重建，
+	 * 重新进入手写时 restoreInkFromStore() 会原样恢复，不存在「笔迹丢了」。
 	 */
-	private async reattachIfReloaded(): Promise<void> {
-		if (!this.active) return;
-		if (this.engine.isHandleAlive) return;
-
-		// 旧 DOM 的绑定全部摘掉（旧节点已不在文档上，留着只是泄漏）
-		this.detachPenInput();
-		this.detachGestureShield();
-		this.detachTouchRouter();
-		this.penBar?.remove();
-		this.penBar = null;
-		this.clearLasso();
-		this.clearEraseRect();
-		try {
-			await this.engine.exit();
-		} catch {
-			/* 旧 handle 已死，exit 只是形式 */
-		}
-
-		await this.enterInk();
-		if (this.active) new Notice('手写批注已保存');
-	}
-
 	private resetInkStateIfDead(): void {
 		if (!this.active) return;
 		this.cancelAutoSave();
 		this.clearLasso();
 		this.clearEraseRect();
+		// 视图已换人：落盘基线一并作废，否则新视图的第一笔会拿旧基线比对
+		this.lastSavedJson = '';
 		this.active = false;
 		document.body.removeClass('fleur-pdf-ink-active');
 		this.syncSwitcher();
@@ -770,6 +908,10 @@ export class InkUI {
 
 	/** 安排一次空闲落盘（每次改动后调用，重复调用只保留最后一次）。 */
 	private scheduleAutoSave(): void {
+		// 先同步刷新内存快照，再排防抖。
+		// 顺序不能反：快照的意义就是「视图还活着的时候把状态接住」，
+		// 放到定时器里就晚了（那时视图可能已经没了）。
+		this.captureSnapshot();
 		if (this.autoSaveTimer !== null) window.clearTimeout(this.autoSaveTimer);
 		this.autoSaveTimer = window.setTimeout(() => {
 			this.autoSaveTimer = null;
@@ -781,6 +923,49 @@ export class InkUI {
 		if (this.autoSaveTimer !== null) {
 			window.clearTimeout(this.autoSaveTimer);
 			this.autoSaveTimer = null;
+		}
+	}
+
+	/**
+	 * 同步把「此刻编辑器里有什么」抄进内存（不落盘）。
+	 *
+	 * 刻意不加节流：调用点是「一笔画完 / 一次擦除完成」，不是 pointermove，
+	 * 一页几百笔时单次开销在毫秒级；而漏掉任何一次都可能正好是视图死前的最后一笔。
+	 */
+	private captureSnapshot(): void {
+		try {
+			if (!this.engine.isHandleAlive) return;
+			const file = this.engine.getFile();
+			if (!file) return;
+			this.lastFile = file;
+			this.lastEntries = this.engine.exportStrokeEntries();
+		} catch {
+			/* 快照失败只是少一层保险，不打断书写 */
+		}
+	}
+
+	/**
+	 * 视图已销毁时的抢存。
+	 *
+	 * 到这一步 pdf.js 的编辑器已经没了，exportStrokeEntries() 只能拿到空数组，
+	 * 所以唯一的补救是把最后一次内存快照（captureSnapshot）写进 sidecar。
+	 * 这是「关闭文件」路径上防掉笔迹的最后一层，与 1500ms 空闲落盘互补：
+	 * 空闲落盘覆盖「写完停手再关」，抢存覆盖「写完立刻关」。
+	 */
+	private async salvageSnapshot(): Promise<boolean> {
+		const file = this.lastFile;
+		const entries = this.lastEntries;
+		if (!file || !entries) return false;
+		const json = JSON.stringify(entries);
+		if (json === this.lastSavedJson) return false;
+		try {
+			await this.inkStore.save(file, entries, Array.from(this.claimedIds));
+			this.lastSavedJson = json;
+			console.log(`[FleurPDF Ink] 视图已销毁，已用内存快照补存 ${entries.length} 条笔迹`);
+			return true;
+		} catch (err) {
+			console.warn('[FleurPDF Ink] 快照补存失败:', err);
+			return false;
 		}
 	}
 

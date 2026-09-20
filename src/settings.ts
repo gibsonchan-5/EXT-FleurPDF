@@ -64,6 +64,30 @@ export interface FleurSettings {
   inkSwitcherSide?: 'left' | 'right';
   inkSwitcherY?: number;
   inkSwitcherCollapsed?: boolean;
+
+  /**
+   * 悬浮入口可见性。
+   *
+   * 背景：胶囊是挂在 document.body 上的，与当前打开的文件无关 —— 用户在
+   * 非 PDF 视图（普通笔记、设置页）里它照样浮着，「全局都显示很碍眼」。
+   * 于是分两层控制：
+   *   ① 运行期自动判定：只有活动文件是 PDF 时才出现（见 InkUI.syncSwitcherVisibility）；
+   *   ② 用户手动彻底关掉：inkSwitcherHidden。
+   */
+  inkSwitcherHidden?: boolean;
+  /**
+   * 胶囊上三段各自的显隐（缺省 = 显示）。
+   *
+   * 三段的语义：编辑 = 退出批注回到普通阅读；手写 = 进入落墨；批注列表 = 打开文本批注侧边栏。
+   * 用户「手写批注和文本批注的按钮要能隐藏」的诉求即落在后两段上，因此逐段给开关，
+   * 而不是只给一个「全有 / 全无」的总闸。
+   */
+  inkShowEditSeg?: boolean;
+  inkShowInkSeg?: boolean;
+  inkShowSideSeg?: boolean;
+
+  /** 隐藏左侧栏的 FleurPDF 图标（全局生效，桌面端与移动端同一条规则）。 */
+  hideRibbonIcon?: boolean;
 }
 
 export const DEFAULT_SETTINGS: FleurSettings = {
@@ -83,6 +107,11 @@ export const DEFAULT_SETTINGS: FleurSettings = {
   sidebarDefaultOpen: true,
   annotationSort: 'time',
   mobileDebug: false,
+  inkSwitcherHidden: false,
+  inkShowEditSeg: true,
+  inkShowInkSeg: true,
+  inkShowSideSeg: true,
+  hideRibbonIcon: false,
 };
 
 export class FleurSettingTab extends PluginSettingTab {
@@ -543,6 +572,71 @@ export class FleurSettingTab extends PluginSettingTab {
         .onChange(async (value) => {
           this.plugin.settings.inkEraserMode = value as 'pixel' | 'stroke' | 'select';
           await this.plugin.saveSettings();
+        }));
+
+    // ── 悬浮按钮：整体显隐 ──
+    // 按钮只在打开 PDF 时出现（运行期自动判定，不占这一栏）；这里管的是「即便在 PDF 里也不想看到它」。
+    new Setting(inkSection)
+      .setName('显示悬浮按钮')
+      .setDesc('右下角的「编辑 / 手写 / 批注」胶囊。按钮仅在当前文件是 PDF 时出现，浏览普通笔记时会自动隐藏；关闭此项则任何情况下都不出现，可在命令面板用「显示 / 隐藏手写批注悬浮按钮」找回。')
+      .addToggle(toggle => toggle
+        .setValue(this.plugin.settings.inkSwitcherHidden !== true)
+        .onChange(async (value) => {
+          this.plugin.settings.inkSwitcherHidden = !value;
+          await this.plugin.saveSettings();
+          this.plugin.inkUI?.refreshVisibility();
+        }));
+
+    // ── 悬浮按钮：逐段显隐 ──
+    const segToggle = (
+      name: string,
+      desc: string,
+      current: boolean,
+      write: (on: boolean) => void,
+    ) => {
+      new Setting(inkSection)
+        .setName(name)
+        .setDesc(desc)
+        .addToggle(toggle => toggle
+          .setValue(current)
+          .onChange(async (value) => {
+            write(value);
+            await this.plugin.saveSettings();
+            this.plugin.inkUI?.refreshVisibility();
+          }));
+    };
+
+    segToggle(
+      '保留「编辑」按钮',
+      '用于从手写模式退回普通阅读。',
+      this.plugin.settings.inkShowEditSeg !== false,
+      (on) => { this.plugin.settings.inkShowEditSeg = on; },
+    );
+    segToggle(
+      '保留「手写批注」按钮',
+      '关闭后胶囊上不再有落墨入口。手写状态下再点一次同一按钮也能退出，所以关掉它不会把人困住。',
+      this.plugin.settings.inkShowInkSeg !== false,
+      (on) => { this.plugin.settings.inkShowInkSeg = on; },
+    );
+    segToggle(
+      '保留「批注列表」按钮',
+      '打开文本批注侧边栏的入口。关掉后仍可用命令面板或普通视图的 ribbon 图标打开侧边栏。',
+      this.plugin.settings.inkShowSideSeg !== false,
+      (on) => { this.plugin.settings.inkShowSideSeg = on; },
+    );
+
+    // ── 界面入口 ──
+    new Setting(containerEl).setName('界面入口').setHeading();
+
+    new Setting(containerEl)
+      .setName('显示左侧栏图标')
+      .setDesc('左侧边栏（移动端需展开抽屉）里的 FleurPDF 图标，用于打开批注侧边栏。关闭后可用命令面板的「打开批注侧边栏」替代。')
+      .addToggle(toggle => toggle
+        .setValue(this.plugin.settings.hideRibbonIcon !== true)
+        .onChange(async (value) => {
+          this.plugin.settings.hideRibbonIcon = !value;
+          await this.plugin.saveSettings();
+          this.plugin.applyRibbonVisibility();
         }));
   }
 

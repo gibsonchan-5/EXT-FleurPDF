@@ -31,6 +31,15 @@ export default class FleurPDFPlugin extends Plugin {
   /** 移动端手写批注的 UI。仅 isMobileUI() 为真时创建，桌面端恒为 null。 */
   inkUI: InkUI | null = null;
 
+  /**
+   * 左侧栏图标元素。
+   *
+   * `addRibbonIcon` 返回的就是那颗 .side-dock-ribbon-action，持有它才能在设置里
+   * 把图标藏起来 —— 真机反馈「批注按钮全局都显示很碍眼」，而 ribbon 是桌面端
+   * 与移动端共用的同一个入口，两边都要能关。
+   */
+  private ribbonEl: HTMLElement | null = null;
+
   /** 当前实际生效的密钥后端（system=钥匙串，vault=data.json 明文）。 */
   get secretBackend(): SecretBackend {
     return resolveBackend(this.app, this.settings.secretStorageMode);
@@ -55,9 +64,10 @@ export default class FleurPDFPlugin extends Plugin {
       return new SidebarView(leaf, this);
     });
 
-    this.addRibbonIcon('file-text', 'FleurPDF', () => {
+    this.ribbonEl = this.addRibbonIcon('file-text', 'FleurPDF', () => {
       void this.activateSidebar();
     });
+    this.applyRibbonVisibility();
 
     this.addCommand({
       id: 'open-sidebar',
@@ -65,17 +75,29 @@ export default class FleurPDFPlugin extends Plugin {
       callback: () => { void this.activateSidebar(); }
     });
 
-    // 悬浮胶囊被长按收起后，必须留一条「用命令就能找回来」的路：
-    // 否则用户一旦收起来，就只能靠再点那个已经变得很不起眼的把手。
+    // 悬浮胶囊被收起 / 被隐藏后，必须留一条「用命令就能找回来」的路：
+    // 否则用户一旦关掉，就只能翻设置页。
     this.addCommand({
       id: 'toggle-ink-switcher',
-      name: '显示 / 收起手写批注悬浮按钮',
+      name: '显示 / 隐藏手写批注悬浮按钮',
       callback: () => {
         if (!this.inkUI) {
           new Notice('当前未启用移动端批注界面');
           return;
         }
         this.inkUI.toggleSwitcher();
+      }
+    });
+
+    // ribbon 图标藏起来之后的找回路径（设置页之外的第二条）。
+    this.addCommand({
+      id: 'toggle-ribbon-icon',
+      name: '显示 / 隐藏左侧栏图标',
+      callback: () => {
+        this.settings.hideRibbonIcon = this.settings.hideRibbonIcon !== true;
+        void this.saveSettings();
+        this.applyRibbonVisibility();
+        new Notice(this.settings.hideRibbonIcon ? '已隐藏左侧栏图标' : '已显示左侧栏图标');
       }
     });
 
@@ -160,6 +182,17 @@ export default class FleurPDFPlugin extends Plugin {
     this.inkUI = null;
     this.inkEngine?.dispose();
     removeInkStyles();
+  }
+
+  /**
+   * 同步左侧栏图标的显隐（设置项 / 命令 / 视图重建后都要调一次）。
+   *
+   * 用 class 而不是 detach()：`addRibbonIcon` 的自动清理只在插件卸载时生效，
+   * 手动 detach 后如果用户又打开开关，就得自己重新 add 一次并重挂 click，
+   * 徒增一条易错分支。加类只影响绘制，元素本身始终在册。
+   */
+  applyRibbonVisibility(): void {
+    this.ribbonEl?.toggleClass('fleur-pdf-ribbon-hidden', this.settings.hideRibbonIcon === true);
   }
 
   /**

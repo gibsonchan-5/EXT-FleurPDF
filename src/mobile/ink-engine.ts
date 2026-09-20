@@ -39,6 +39,7 @@
 //    但「画」仍然正常 —— 用户会以为是按钮坏了。所以这是本模块必须收口的第一风险。
 
 import { App, TFile, loadPdfJs } from 'obsidian';
+import { stripInkIdentity, type InkEntry } from './ink-store';
 
 /* ---------------------------------------------------------------------------
  * 类型
@@ -255,17 +256,79 @@ export function readInkGeometry(editor: any): InkGeometry | null {
 /**
  * 抹掉「重建数据」里的身份与副本标记。
  *
- * · `id` / `annotationElementId`：去掉才能让重建对象以「新建注释」入库；
- *   留着的话 pdf.js 会把它当成「更新文件里那条注释」，而旧注释已被删除，语义打架。
- * · `isCopy`：来自 serialize(true)。DrawingEditor.render() 里有
- *   `if (this._isCopy) { ... this._moveAfterPaste(t, e) }`，会把重建的笔迹再平移一次。
+ * 实现已上移到数据层（`ink-store.ts`）—— 因为「写进 JSON 的笔迹快照」与
+ * 「擦除 / 套索重建时的数据」必须走**同一套**清理规则：两边各维护一份迟早漂移，
+ * 而这里漏掉任何一个字段，症状都是「擦完这一笔之后再也擦不动」。
+ * 此处只做 re-export，保持 ink-erase / ink-lasso 既有的 import 路径不变。
  */
-export function stripInkIdentity(data: any): any {
-	const out = { ...data };
-	delete out.id;
-	delete out.annotationElementId;
-	delete out.isCopy;
-	return out;
+export { stripInkIdentity };
+
+/**
+ * 编辑器是否墨迹编辑器。
+ *
+ * pdf.js 用类的静态属性 `_type` 标识类型（旧版本是 `type`）；别处的写法是
+ * `e?.constructor?._type ?? e?.constructor?.type`，这里收口成一个函数，
+ * 免得每处各写一遍、漏了回退分支就把墨迹当成别的编辑器跳过。
+ */
+export function isInkEditor(editor: any): boolean {
+	try {
+		const t = editor?.constructor?._type ?? editor?.constructor?.type;
+		return t === 'ink';
+	} catch {
+		return false;
+	}
+}
+
+/** 我们给笔迹分配的编辑器 id 前缀。加前缀是为了永不与 pdf.js 自己的 id 撞车。 */
+const STROKE_ID_PREFIX = 'fleur-ink-';
+
+/**
+ * 生成一条笔迹的编辑器 id（**必须是批内唯一且可复现的**）。
+ *
+ * ⚠️ **这不是装饰，漏掉它会导致静默丢笔迹，改动前务必读完。**
+ *
+ * 依据 Obsidian 内置 pdf.js 的构建产物（.qa/obs-pdfjs/pdf.min.mjs，已逐字核对）：
+ *
+ *   // AnnotationEditor 构造函数
+ *   this.id = t.id;                                  // ★ 没有 uid 兜底，缺就真是 undefined
+ *   // AnnotationEditorLayer
+ *   attach(t){ this.#editors.set(t.id, t) }           // 以 id 为 Map 键
+ *   // AnnotationEditorUIManager
+ *   addEditor(t){ this.#editors.set(t.id, t) }
+ *   getEditors(page){ for(const e of this.#editors.values()) e.pageIndex===page && push(e) }
+ *
+ * 而 `serialize(true)` 在 pdf.js 里是**提前 return** 的：
+ *
+ *   serialize(){ ... if(t){ o.isCopy=!0; return o }   // ← 这里返回的 o 里没有 id
+ *                o.id = this.annotationElementId; return o }
+ *
+ * 于是从 sidecar 重建时 `data.id` 是 undefined ⇒ 所有重建出来的编辑器在
+ * UIManager 的 Map 里**共用一个 `undefined` 键**，只剩最后一条能被 getEditors 取到 ⇒
+ * 下一次导出只导出 1 条 ⇒ 再存盘就把其余笔迹全删了。
+ *
+ * 所以：导出时按「页 + 页内序号」派生一个可复现的 id 写进 JSON，
+ * 恢复时再据此赋给编辑器（见 restoreStrokeEntries）。
+ * 用序号而不是随机值 —— 内容没变时导出结果必须逐字节相同，否则
+ * 「内容指纹比对」会失效，每次空闲都白写一次盘。
+ */
+function strokeId(page: number, index: number): string {
+	return `${STROKE_ID_PREFIX}${page}-${index}`;
+}
+
+/** 会话内递增序号，供「删旧重建」路径取一次性 id（擦除 / 套索）。 */
+let rebuildSeq = 0;
+
+/**
+ * 取一个本次会话内唯一的编辑器 id（擦除 / 套索重建用）。
+ *
+ * 前缀里的 `r` 段与 `strokeId()` 的 `<页>-<序>` 格式不同，两套命名永不碰撞：
+ * 恢复出来的笔迹用前者，重建出来的用后者，用户新画的用 pdf.js 自己的数字 id。
+ *
+ * @returns 新的 id 字符串
+ */
+export function mintStrokeId(): string {
+	rebuildSeq += 1;
+	return `${STROKE_ID_PREFIX}r${rebuildSeq}`;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1057,7 +1120,12 @@ export class InkEngine {
 	 * 产出是标准 PDF（钢笔与荧光笔同为 /Subtype /Ink + /InkList），
 	 * 因此批注不是插件私有产物 —— 换任何阅读器都看得见。
 	 *
-	 * 本方法只负责「生成字节」，不写盘。写盘与备份由 ink-storage.ts 承担。
+	 * ⚠️ 0.5 起**主流程已不再调用本方法**：笔迹的落盘改由 `ink-store.ts` 以 sidecar
+	 * JSON 承担（理由见该文件开头的架构说明 —— 写回 PDF 会触发视图重载、且固有编辑器
+	 * 擦不掉）。本方法保留下来，作为「导出到 PDF」（把笔迹烧进副本、不覆盖原文件）
+	 * 这一后续能力的基础 —— 那是唯一还需要真正改写 PDF 字节的场景。
+	 *
+	 * 本方法只负责「生成字节」，不写盘。
 	 *
 	 * ⚠️ **落盘前必须先确认「真的有东西可写」** —— 这是 0.4.4 补的第二道闸门，
 	 * 针对的是 pdf.js 一个极隐蔽的静默失败。依据 Obsidian 内置 pdf.js 构建产物
@@ -1082,13 +1150,13 @@ export class InkEngine {
 	 * 而 worker 侧收到空 changes 时是 `return originalBytes`（直接回吐原文件字节，不报错）。
 	 *
 	 * 三条合起来的后果非常危险：
-	 *   ① 产出字节**长度非 0**，ink-storage 的 `bytes.length === 0` 校验抓不住；
+	 *   ① 产出字节**长度非 0**，落盘方按 `bytes.length === 0` 做的空判抓不住；
 	 *   ② 写回去的是原文件的完整副本 —— 文件看起来「被保存过了」；
 	 *   ③ resetModified() 把 dirty 清掉，于是后续自动落盘直接跳过「没有未保存内容」。
 	 *   ⇒ 用户的笔迹**一次都不会真正进文件**，且插件全程不报错。
 	 *
 	 * 所以这里先自己算一遍 `serializable.map.size`：为 0 就返回 null，
-	 * 让 ink-storage 以 reason:'empty' 收场（不写盘、不清 dirty）。下次落盘会重试。
+	 * 让调用方以「无内容」收场（不写盘、不清 dirty）。下次落盘会重试。
 	 */
 	async exportAnnotatedBytes(): Promise<Uint8Array | null> {
 		const doc = this.handle?.pdfDocument;
@@ -1112,6 +1180,204 @@ export class InkEngine {
 		}
 	}
 
+	/* -------------------- 笔迹快照（方案 C 的存取口） -------------------- */
+
+	/**
+	 * 导出所有页的笔迹快照 —— 写进 sidecar 的数据源。
+	 *
+	 * 与 `exportAnnotatedBytes` 的根本区别：
+	 *   · 后者产出**整份 PDF 字节**，写盘要改写用户的 PDF 文件 ⇒ Obsidian 销毁重建
+	 *     视图 ⇒ 内存里尚未写回的笔迹随之全丢（真机反馈的「只存开头几笔」）；
+	 *   · 这里只产出**笔迹数据**，写进插件自己的 JSON，完全不触碰 PDF ⇒
+	 *     可以高频、静默地存，不会引发任何重载。
+	 *
+	 * 用 `serialize(true)` 而非 `serialize()`：固有编辑器在后者下恒返回 null，
+	 * 详见 readInkGeometry 的长注释。
+	 */
+	exportStrokeEntries(): InkEntry[] {
+		const out: InkEntry[] = [];
+		for (let page = 0; page < this.pageCount; page++) {
+			let editors: any[] = [];
+			try {
+				editors = this.getEditors(page);
+			} catch {
+				continue; // 该页还没渲染出编辑层 —— 跳过，不影响其余页
+			}
+			let idx = 0;
+			for (const editor of editors) {
+				if (!isInkEditor(editor)) continue;
+				const geom = readInkGeometry(editor);
+				if (!geom) continue;
+				const data = stripInkIdentity(geom.data);
+				// ★ 必须补一个 id，原因见 strokeId 的长注释。
+				data.id = strokeId(page, idx++);
+				out.push({ page, data });
+			}
+		}
+		return out;
+	}
+
+	/**
+	 * 从快照恢复编辑器。
+	 *
+	 * 恢复出来的编辑器**不带 `annotationElementId`**（快照里已剔除），所以 pdf.js
+	 * 把它当作「本次会话新画的」—— `serialize()` 永远正常返回，擦除 / 套索 / 移动
+	 * 在任何时候都拿得到几何数据。
+	 *
+	 * 这是「不论关闭笔记重新打开，历史笔迹都要能擦」的实现根基：我们不再依赖
+	 * pdf.js 那套「把文件固有注释转成可编辑对象」的机制 —— 它要求注释层先渲染完，
+	 * 时机不可控（0.4.4 的播种只跑一次、450ms 就放弃，注释没渲染出来就永久失败）。
+	 *
+	 * @returns 成功重建出来的那些 entry 的 `sourceId` 集合，供调用方决定「哪些
+	 *          固有注释可以安全隐藏」。只 hide 重建成功的那些：万一某条数据坏了
+	 *          建不出来，把原件也一并藏掉就等于笔迹凭空消失。
+	 */
+	async restoreStrokeEntries(entries: InkEntry[]): Promise<Set<string>> {
+		const restoredSourceIds = new Set<string>();
+		if (!entries.length) return restoredSourceIds;
+		// 按页分组：deserialize 必须用该页自己的编辑器层
+		const byPage = new Map<number, InkEntry[]>();
+		for (const entry of entries) {
+			const list = byPage.get(entry.page);
+			if (list) list.push(entry);
+			else byPage.set(entry.page, [entry]);
+		}
+
+		for (const [page, list] of byPage) {
+			const layer = this.getLayer(page);
+			if (!layer?.deserialize) continue;
+			let idx = 0;
+			for (const entry of list) {
+				const id = strokeId(page, idx++);
+				try {
+					// pageIndex 以快照记录为准：跨页搬运过的笔迹可能与 data 里的旧值不一致。
+					// ⚠️ 这里**故意不传 `id`**：InkEditor.deserialize 末尾会执行
+					// `s.annotationElementId = t.id || null`，传进去就等于把我们自己
+					// 编的 id 冒充成 PDF 注释 id，serialize() 会重新开始返回 null
+					// （就是这次要根治的那个坑）。id 必须在 deserialize 之后、add 之前
+					// 直接赋给编辑器 —— add() 内部用 editor.id 作 Map 键。
+					const editor = await layer.deserialize({ ...entry.data, id: undefined, pageIndex: page });
+					if (!editor) continue;
+					editor.id = id;
+					try {
+						layer.add?.(editor); // deserialize 不保证入层；已入层时 add 自带守卫，是空操作
+					} catch {
+						/* 已在层里 */
+					}
+					// 二次确认：万一 deserialize 从别处拿到了 id，这里也不能让它留着
+					if (editor.annotationElementId) editor.annotationElementId = null;
+					try {
+						editor.enableEditing?.();
+					} catch {
+						/* 非致命：不能编辑但至少看得见 */
+					}
+					if (entry.sourceId) restoredSourceIds.add(entry.sourceId);
+				} catch {
+					/* 单条失败不影响其余笔迹 */
+				}
+			}
+		}
+		return restoredSourceIds;
+	}
+
+	/**
+	 * 接管 PDF 里既有的固有手写注释（0.4.x → 0.5 的迁移，且是**增量、可重入**的）。
+	 *
+	 * 0.4.x 是把笔迹写回 PDF 的，所以老用户的文件里躺着 `/Subtype /Ink` 注释。
+	 * 新版不再写回，必须把这些笔迹接管进我们自己的数据 —— 否则它们既不属于我们的
+	 * 数据（擦不掉），又会在 PDF 里继续显示（与接管后的重建体重影）。
+	 *
+	 * ⚠️ 刻意**不建临时编辑器**。早先的实现走的是 `layer.deserialize(el)` 再
+	 * `editor.remove()`：deserialize 会把编辑器登记进层的私有 Map 与 UIManager，
+	 * 而 `editor.remove()` 只摘除 DOM、不动那两张表，于是留下一批「父级为 null
+	 * 但仍在册」的幽灵编辑器 —— 它们会被下一次 exportStrokeEntries 当作真实笔迹
+	 * 导出，笔迹凭空翻倍，且擦掉一份还剩一份（正是用户报的「擦不掉」）。
+	 *
+	 * 现在改为**纯数据转换**：注释元素上本来就带着画这条笔迹所需的全部字段，
+	 * 按 pdf.js `InkEditor.deserialize` 的同一映射照搬即可，全程不碰编辑层。
+	 *
+	 * @param skipIds 已经认领过的注释 id（含已被擦除的）—— 必须跳过，否则
+	 *                用户擦掉的笔迹会在下次进入时从 PDF 原件里「复活」。
+	 */
+	async claimInherentInk(skipIds: Set<string> = new Set()): Promise<InkEntry[]> {
+		const entries: InkEntry[] = [];
+		if (!this.pageCount) return entries;
+
+		for (let page = 0; page < this.pageCount; page++) {
+			const annLayer = this.getAnnotationLayer(page);
+			if (!annLayer?.getEditableAnnotations) continue;
+
+			let elements: any[] = [];
+			try {
+				elements = annLayer.getEditableAnnotations() ?? [];
+			} catch {
+				continue; // 该页注释层还没渲染出来 —— 下一页
+			}
+
+			let idx = 0;
+			for (const el of elements) {
+				const d = el?.data;
+				if (!d || d.subtype !== 'Ink' || !d.id) continue;
+				if (skipIds.has(d.id)) continue;
+				if (!Array.isArray(d.inkLists) || !d.inkLists.length) continue;
+
+				// 颜色必须是**非空数组**：pdf.js 会把它直接塞进 SVG 的 stroke
+				// （stroke: [0,0,0] 这种写法无效，笔画会整条看不见）。
+				const color = Array.from((d.color ?? []) as ArrayLike<number>);
+				if (color.length < 3) color.push(0, 0, 0);
+
+				const data: Record<string, unknown> = {
+					annotationType: this.constants?.AnnotationEditorType?.INK ?? 15,
+					color,
+					thickness: d.borderStyle?.rawWidth ?? 1,
+					opacity: typeof d.opacity === 'number' ? d.opacity : 1,
+					paths: { points: d.inkLists }, // 缺 lines 无妨：InkDrawOutline.deserialize 会从 points 反推
+					boxes: null,
+					pageIndex: page,
+					rect: Array.isArray(d.rect) ? d.rect.slice(0) : d.rect,
+					rotation: typeof d.rotation === 'number' ? d.rotation : 0,
+					id: strokeId(page, idx),
+				};
+				idx++;
+				entries.push({ page, data, sourceId: d.id });
+			}
+		}
+		return entries;
+	}
+
+	/**
+	 * 隐藏已被我们接管的固有注释（消除「PDF 原件 + 重建体」双影）。
+	 *
+	 * 只对 `ids` 里的注释动手，不碰用户用别的工具新加进来的笔迹。
+	 * `hide()` 是 pdf.js 注释元素的公开方法（官方把固有注释转成编辑器时用的就是它），
+	 * 只在当前会话生效，不修改文件。
+	 */
+	hideInherentInk(ids: Set<string>): number {
+		if (!ids.size) return 0;
+		let hidden = 0;
+		for (let page = 0; page < this.pageCount; page++) {
+			const annLayer = this.getAnnotationLayer(page);
+			if (!annLayer?.getEditableAnnotations) continue;
+			let elements: any[] = [];
+			try {
+				elements = annLayer.getEditableAnnotations() ?? [];
+			} catch {
+				continue;
+			}
+			for (const el of elements) {
+				const id = el?.data?.id;
+				if (!id || !ids.has(id)) continue;
+				try {
+					el.hide?.();
+					hidden++;
+				} catch {
+					/* 单条失败不影响其余 */
+				}
+			}
+		}
+		return hidden;
+	}
+
 	/**
 	 * AnnotationStorage 里是否存在「能真正序列化出来」的条目。
 	 *
@@ -1127,6 +1393,45 @@ export class InkEngine {
 			// 探测本身失败时选择「按有内容处理」：宁可多写一次（幂等），也不要漏存。
 			return true;
 		}
+	}
+
+	/**
+	 * 清掉当前所有墨迹编辑器（只针对墨迹，不碰自由文本 / 高亮等其它编辑器）。
+	 *
+	 * 用途：重进手写模式前先归零。pdf.js 退出编辑模式并**不销毁**已建好的编辑器，
+	 * 它们仍留在层与 UIManager 的表里；如果直接再恢复一遍，同一份数据会被建成
+	 * 两套对象、共用同一组 id，后一套把前一套从表里挤掉 —— 前一套就成了看不见
+	 * 又删不掉的幽灵，而导出只会拿到后一套。
+	 *
+	 * 走 `layer.remove()` 而不是 `editor.remove()`：前者会同步清理层与 UIManager
+	 * 的两张表，后者只摘 DOM。
+	 */
+	clearInkEditors(): number {
+		let removed = 0;
+		for (let page = 0; page < this.pageCount; page++) {
+			const layer = this.getLayer(page);
+			if (!layer?.remove) continue;
+			let editors: any[] = [];
+			try {
+				editors = this.getEditors(page);
+			} catch {
+				continue;
+			}
+			for (const editor of editors) {
+				if (!isInkEditor(editor)) continue;
+				try {
+					layer.remove(editor);
+					removed++;
+				} catch {
+					try {
+						editor.remove?.();
+					} catch {
+						/* 单个失败不影响其余 */
+					}
+				}
+			}
+		}
+		return removed;
 	}
 
 	/** 把落盘结果标记为「已保存」，清掉 pdf.js 的 dirty 状态（避免重复写盘）。 */

@@ -1434,6 +1434,16 @@ body.fleur-pdf-mobile .fleur-pdf-ink-toggle.is-collapsed:active::after {
   opacity: 1;
 }
 
+/* ── 悬浮胶囊 / 单段的隐藏 ──
+   三种情况都落到 .is-hidden 上：用户主动关掉、当前不在 PDF 视图、三段全被关掉。
+   必须 !important：.is-collapsed 那条规则改的是 padding/gap/背景，两者叠加时
+   隐藏要无条件胜出，否则会出现「设了隐藏还留着一个把手」。
+   注意不要写成 is-collapsed 的兄弟选择器 —— 两层状态是正交的，可同时为真。 */
+body.fleur-pdf-mobile .fleur-pdf-ink-toggle.is-hidden,
+body.fleur-pdf-mobile .fleur-pdf-ink-switch-btn.is-hidden {
+  display: none !important;
+}
+
 /* 图标尺寸自持：不能依赖 Obsidian 全局的 svg.svg-icon 规则 ——
    移动端 app.css 的版本差异 / 加载时序都可能让该规则缺位，
    SVG 没有内在尺寸时会在 flex 里被压成一条竖缝（0.1.0 真机「图标几乎不可见」的根因）。
@@ -1816,4 +1826,15 @@ body.fleur-pdf-mobile .fleur-sidebar-icon-btn {
 .fleur-sidebar-card-type svg {
   width: 14px;
   height: 14px;
+}
+
+/* ============================================================
+   界面入口显隐
+   ------------------------------------------------------------
+   全局规则（不挂在 body.fleur-pdf-mobile 下）：左侧栏图标在桌面端与移动端
+   是同一个元素，两边的用户都有「不想看到它」的需求。
+   由 main.ts 的 applyRibbonVisibility() 切换这个类。
+   ============================================================ */
+.fleur-pdf-ribbon-hidden {
+  display: none !important;
 }
