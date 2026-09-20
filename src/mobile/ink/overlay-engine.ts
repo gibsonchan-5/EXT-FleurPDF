@@ -65,7 +65,10 @@ const MAX_CANVAS_PIXELS = 72_000_000;
 export type InkTool =
 	| { mode: 'pen'; color: string; width: number; opacity: number; kind: InkStrokeKind }
 	| { mode: 'eraser'; radius: number }
-	| { mode: 'lasso' };
+	| { mode: 'lasso' }
+	// 手指滚动：canvas touch-action:none 之后浏览器不再代管平移，滚动由我们驱动。
+	// 用户的工具选择永远不会落到 scroll 上 —— 它只由 touch pointerdown 触发。
+	| { mode: 'scroll' };
 
 /** 一个页面的覆盖层。committed 常驻显示；draft 只放「进行中」的东西（荧光笔预览 / 橡皮光标 / 套索框）。 */
 interface Surface {
@@ -104,6 +107,9 @@ interface ActiveGesture {
 	moveOrig?: Map<string, number[]>;
 	moveRectOrig?: { x0: number; y0: number; x1: number; y1: number };
 	moveStart?: { x: number; y: number };
+	// scroll（手指滚动）
+	scrollLast?: { x: number; y: number };
+	scrollEl?: HTMLElement | null;
 }
 
 /** 套索选区（PDF 用户空间矩形）。 */
@@ -576,19 +582,29 @@ export class InkOverlayEngine {
 	}
 
 	private onPointerDown = (e: PointerEvent): void => {
+		if (e.pointerType === 'touch') {
+			// 手指只滚动，永不落墨（画 / 擦 / 套索是笔和鼠标的活）。
+			// 笔活动窗口内的 touch 一律视为掌压 → 无视，防止书写时掌缘把页面拖走。
+			if (this.active || performance.now() < this.penActivityUntil) return;
+			const sf = this.surfaceOfEvent(e);
+			if (!sf) return;
+			this.beginScrollGesture(e, sf);
+			return;
+		}
+
+		// 笔 / 鼠标。若手指滚动正在进行（掌缘先落、笔后到），滚动立即让位 —— 书写优先。
+		if (this.active?.tool.mode === 'scroll') this.finishGesture(false);
+
 		if (!this.active) {
 			const sf = this.surfaceOfEvent(e);
 			if (!sf) return;
-			// touch 永不落墨（掌压拒止 + 手指滚动全交给浏览器原生处理）
-			if (e.pointerType === 'touch') return;
-			// 笔活动窗口内拒绝一切新 touch 起势（此刻不会走到，touch 在上面已拦）
 			this.penActivityUntil = performance.now() + PEN_TOUCH_REJECTION_MS;
 			this.beginGesture(e, sf);
 			return;
 		}
 		// 已有手势进行中 —— 断触宽限内的续写判定：
 		// 同为笔（旧指针已 cancel）→ 换绑到新指针继续画
-		if (this.cancelTimer !== null && e.pointerType !== 'touch' && this.active.stroke) {
+		if (this.cancelTimer !== null && this.active.stroke) {
 			window.clearTimeout(this.cancelTimer);
 			this.cancelTimer = null;
 			this.active.pointerId = e.pointerId;
@@ -608,6 +624,17 @@ export class InkOverlayEngine {
 
 		if (g.tool.mode === 'pen') {
 			this.appendDrawEvent(e);
+			return;
+		}
+		if (g.tool.mode === 'scroll') {
+			// 手指滚动：move 的位移直接灌给滚动容器（touch-action:none 后浏览器不管平移了）。
+			// 必须放在坐标转换之前 —— 手指经常滚出页面边界，cssToPdf 对界外返回 null。
+			g.moved = true;
+			if (g.scrollEl) {
+				g.scrollEl.scrollTop -= e.clientY - (g.scrollLast?.y ?? e.clientY);
+				g.scrollEl.scrollLeft -= e.clientX - (g.scrollLast?.x ?? e.clientX);
+			}
+			g.scrollLast = { x: e.clientX, y: e.clientY };
 			return;
 		}
 		const sf = g.surface;
@@ -654,13 +681,45 @@ export class InkOverlayEngine {
 		this.finishGesture(false);
 	};
 
-	/** 笔活动期间的 touchmove 一律拦下，防止掌压把页面滚走（WebKit 的 touch-action 切换是异步的，拦事件才可靠）。 */
+	/** 手势期间（笔迹或手指滚动）的 touchmove 一律拦下：touch-action 已是 none，这里兜底防掌压滚动与下拉刷新。 */
 	private onTouchMoveGuard = (e: TouchEvent): void => {
-		if (!this.active?.stroke) return;
-		e.preventDefault();
+		const g = this.active;
+		if (!g) return;
+		if (g.tool.mode === 'scroll' || g.stroke) e.preventDefault();
 	};
 
 	/* ------------------------------ 手势 ------------------------------ */
+
+	/**
+	 * 手指滚动手势：canvas touch-action:none 之后浏览器不再代管平移，
+	 * 滚动由 move 里程序化驱动（参照 mobile-ink-annotation / handwriting-natively）。
+	 * 不做快照、不入 undo —— 滚动不产生数据变更。
+	 */
+	private beginScrollGesture(e: PointerEvent, sf: Surface): void {
+		this.active = {
+			pointerId: e.pointerId,
+			pointerType: e.pointerType,
+			surface: sf,
+			tool: { mode: 'scroll' },
+			moved: false,
+			snapshot: new Map(),
+			scrollLast: { x: e.clientX, y: e.clientY },
+			scrollEl: this.findScrollable(sf.el),
+		};
+	}
+
+	/** 从页面向上找第一个真正可滚动的祖先（Obsidian 移动端 PDF 视图的滚动容器）。 */
+	private findScrollable(from: HTMLElement): HTMLElement | null {
+		let el: HTMLElement | null = from;
+		while (el && el !== document.body) {
+			if (el.scrollHeight > el.clientHeight + 2) {
+				const ov = getComputedStyle(el).overflowY;
+				if (ov === 'auto' || ov === 'scroll' || ov === 'overlay') return el;
+			}
+			el = el.parentElement;
+		}
+		return null;
+	}
 
 	private beginGesture(e: PointerEvent, sf: Surface): void {
 		// 物理橡皮擦（触控笔尾端）：W3C 规定 eraser 端 button=5 / buttons bit32
@@ -736,6 +795,8 @@ export class InkOverlayEngine {
 		this.active = null;
 		document.body.removeClass('fleur-pdf-ink-stroking');
 		const sf = g.surface;
+
+		if (g.tool.mode === 'scroll') return; // 滚动无数据变更，无需收尾
 
 		if (g.tool.mode === 'pen' && g.stroke) {
 			const stroke = g.stroke;

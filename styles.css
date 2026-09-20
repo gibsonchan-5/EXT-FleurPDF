@@ -1741,19 +1741,21 @@ body.fleur-pdf-mobile .fleur-pdf-ink-eraser-pop .fleur-pdf-ink-modes {
    桌面端 28px 的按钮在平板上点不准（真机反馈）；移动端整体放大到 40px 命中区，
    并给容器加横向滚动兜住小屏（按钮变多时不会溢出屏幕）。 */
 body.fleur-pdf-mobile .fleur-context-panel {
-  /* max-width 约束的是内容盒：缺 box-sizing 时还要再叠加 padding 与边框。
-     实测（Playwright 复现 412px 视口）：面板总宽 414px、scrollWidth 449 > clientWidth 412，
-     即面板比屏幕还宽 —— 右侧按钮被切在屏幕外，且整个面板横向可拖。 */
   box-sizing: border-box;
   gap: 2px;
   padding: 4px;
   border-radius: 10px;
-  max-width: calc(100vw - 16px);
-  overflow-x: auto;
-  overflow-y: hidden;
-  -webkit-overflow-scrolling: touch;
-  /* 面板内部的横向滚动自己处理，别让 Obsidian 的触摸手势半路接管 */
-  touch-action: pan-x;
+  /* 0.6.0 真机反馈：单行 ~350px 在窄屏/分屏下左右图标被截断（overflow-x 滚动
+     也只是把截断变成「要滑动才能看到」）。改为两行自动换行 + 收窄上限，
+     所有图标一次可见。9 个 32px 按钮按 5+4 分两行 ≈ 176px 宽。 */
+  max-width: 188px;
+  flex-wrap: wrap;
+  justify-content: center;
+  row-gap: 3px;
+}
+/* 两行布局下竖分隔线的语义消失（不再承担「分组」的视觉职责），隐藏 */
+body.fleur-pdf-mobile .fleur-context-sep {
+  display: none;
 }
 
 /* 0.4.1 曾把触摸目标放到 40px，真机反馈「菜单太大」—— 现在收到 32px：
@@ -1844,20 +1846,18 @@ body.fleur-pdf-mobile .fleur-sidebar-icon-btn {
    ------------------------------------------------------------
    committed 层接收输入并常驻显示；draft 层只放进行中的预览
    （荧光笔 / 橡皮光标 / 套索框），不接收事件。
-   touch-action 默认放行平移 —— 手指滚动走浏览器原生路径，
-   笔不受 touch-action 影响；正在运笔时由
-   body.fleur-pdf-ink-stroking 全面禁掉，防掌压滚动。
+   touch-action 必须是 none：按 Pointer Events 规范，touch-action
+   同时约束 touch 与 pen 指针 —— 放行 pan 的话，触控笔一落下
+   浏览器就接管滚动并发 pointercancel（表现为：写字跳屏、橡皮
+   回滚、套索失效）。滚动改由引擎的手指滚动手势程序化驱动。
    ============================================================ */
 .fleur-ink-canvas {
   position: absolute;
   inset: 0;
-  touch-action: pan-x pan-y;
+  touch-action: none;
   z-index: 3;
 }
 .fleur-ink-canvas.is-draft {
   pointer-events: none;
   z-index: 4;
-}
-body.fleur-pdf-ink-stroking .fleur-ink-canvas {
-  touch-action: none;
 }

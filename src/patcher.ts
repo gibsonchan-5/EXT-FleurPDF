@@ -176,7 +176,14 @@ export class PDFPatcher {
    *   ② 判定时：有选区 → 弹/保持；没选区且面板已显示超过 350ms → 收起
    *      （350ms 宽限期用来避开「刚弹出就收到 collapse」的收尾竞态）。
    */
-  private static readonly SELECTION_SETTLE_MS = 300;
+  /**
+   * 去抖时长。0.5 是 300ms（FleurEPUB 同构），0.6.0 真机（小米平板）反馈：
+   * 菜单弹出来的时候，系统选区两端的拖拽滑杆还没就位 —— 滑杆比选区文字晚出现，
+   * 而菜单先弹，观感就是「太快了」。Android 上滑杆出现没有可监听的事件，
+   * 只能把去抖放宽到 600ms 给它留时间。拖动选择手柄期间 selectionchange
+   * 连续派发、计时器不断重置，拖动全程依旧不会弹菜单。
+   */
+  private static readonly SELECTION_SETTLE_MS = 600;
   /**
    * 当前面板若是「选区自动唤起」的，记下它对应的选区指纹；否则为空串。
    *
@@ -948,9 +955,11 @@ export class PDFPatcher {
     this.lastAutoMenuKey = key;
 
     const rect = range.getBoundingClientRect();
+    // ↓ 44px：Android 选区两端的原生拖拽滑杆有 ~36px 高、从选区下角向下伸，
+    // 10px 的旧间距会让菜单正好压在滑杆上（真机反馈「滑杆挡住菜单」）。
     void this.showContextMenu(
       Math.min(Math.max(8, rect.left + rect.width / 2), Math.max(8, window.innerWidth - 8)),
-      rect.bottom + 10,
+      rect.bottom + 44,
       snapshot,
       [],
       // 声明这是「选区自动唤起」的面板：onSelectionChange 据此判断能否在选区变化时收起它。
