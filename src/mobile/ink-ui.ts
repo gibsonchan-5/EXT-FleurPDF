@@ -619,6 +619,12 @@ export class InkUI {
 		const bar = document.body.createDiv('fleur-pdf-ink-bar');
 		this.penBar = bar;
 
+		// ── 拖把手（笔盒整体拖动的唯一入口：只认把手，按钮区不受影响）──
+		const grip = bar.createDiv('fleur-pdf-ink-grip');
+		setIcon(grip, 'grip-vertical');
+		grip.setAttribute('aria-label', '拖动笔盒');
+		this.attachBarDrag(bar, grip);
+
 		// ── 笔 ──
 		const penGroup = bar.createDiv('fleur-pdf-ink-group');
 		this.pens.forEach((pen, i) => {
@@ -714,6 +720,116 @@ export class InkUI {
 			e.stopPropagation();
 			void this.exitInk();
 		});
+
+		// 笔盒每次都被整体重建（选笔 / 换色等都会走 refreshPenBar）——
+		// 重建后必须把用户拖过的位置贴回去，否则一换笔就跳回底部居中。
+		this.applyBarPos();
+	}
+
+	/* ==================== 笔盒：拖动与位置恢复 ==================== */
+
+	/**
+	 * 把笔盒放回用户上次拖到的位置（视口比例 → 像素，钳在屏幕内）。
+	 * 没拖过（无 inkBarPos）→ 什么都不做，走 CSS 默认（底部居中）。
+	 */
+	private applyBarPos(): void {
+		const bar = this.penBar;
+		if (!bar) return;
+		const pos = this.plugin.settings.inkBarPos;
+		if (!pos) return;
+		const w = bar.offsetWidth;
+		const h = bar.offsetHeight;
+		if (!w || !h) return; // 尚未布局完成，等下一次重建再贴
+		const left = Math.min(window.innerWidth - w - 8, Math.max(8, pos.x * window.innerWidth - w / 2));
+		const top = Math.min(window.innerHeight - h - 8, Math.max(8, pos.y * window.innerHeight - h / 2));
+		bar.setCssStyles({
+			left: `${Math.round(left)}px`,
+			top: `${Math.round(top)}px`,
+			right: 'auto',
+			bottom: 'auto',
+			transform: 'none',
+		});
+	}
+
+	/**
+	 * 笔盒拖动：只认把手（grip），阈值 6px 以内当误触。
+	 * 位移改 left/top（transform 归零），松手把中心点折成视口比例存进设置。
+	 */
+	private attachBarDrag(bar: HTMLElement, grip: HTMLElement): void {
+		let dragging = false;
+		let moved = false;
+		let startX = 0;
+		let startY = 0;
+		let originLeft = 0;
+		let originTop = 0;
+
+		grip.addEventListener('pointerdown', (e) => {
+			if (e.pointerType === 'mouse' && e.button !== 0) return;
+			dragging = true;
+			moved = false;
+			startX = e.clientX;
+			startY = e.clientY;
+			const r = bar.getBoundingClientRect();
+			originLeft = r.left;
+			originTop = r.top;
+			bar.setCssStyles({
+				left: `${originLeft}px`,
+				right: 'auto',
+				bottom: 'auto',
+				top: `${originTop}px`,
+				transform: 'none',
+			});
+			try {
+				grip.setPointerCapture(e.pointerId);
+			} catch {
+				/* 某些 WebView 对已释放指针抛错，忽略 */
+			}
+			e.preventDefault();
+			e.stopPropagation();
+		}, true);
+
+		grip.addEventListener('pointermove', (e) => {
+			if (!dragging) return;
+			e.preventDefault();
+			const dx = e.clientX - startX;
+			const dy = e.clientY - startY;
+			if (!moved) {
+				if (Math.hypot(dx, dy) < 6) return;
+				moved = true;
+				bar.addClass('is-dragging');
+			}
+			bar.setCssStyles({ left: `${originLeft + dx}px`, top: `${originTop + dy}px` });
+		});
+
+		const finish = (e: PointerEvent) => {
+			if (!dragging) return;
+			dragging = false;
+			try {
+				grip.releasePointerCapture?.(e.pointerId);
+			} catch {
+				/* 忽略 */
+			}
+			if (!moved) {
+				bar.removeClass('is-dragging');
+				this.applyBarPos();
+				return;
+			}
+			bar.removeClass('is-dragging');
+			// 吞掉拖动收尾产生的 click，防止误触
+			grip.addEventListener('click', (ev) => {
+				ev.stopPropagation();
+				ev.preventDefault();
+			}, { capture: true, once: true });
+			const r = bar.getBoundingClientRect();
+			this.plugin.settings.inkBarPos = {
+				x: Math.min(1, Math.max(0, (r.left + r.width / 2) / window.innerWidth)),
+				y: Math.min(1, Math.max(0, (r.top + r.height / 2) / window.innerHeight)),
+			};
+			void this.plugin.saveSettings().catch(() => undefined);
+			this.applyBarPos();
+		};
+		grip.addEventListener('pointerup', finish);
+		grip.addEventListener('pointercancel', finish);
 	}
 
 	private closePops(except: HTMLElement): void {

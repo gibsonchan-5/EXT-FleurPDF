@@ -160,6 +160,8 @@ export class PDFPatcher {
   /** 移动端：选中文字后自动唤出批注菜单（桌面端走右键，不挂这些监听）。 */
   private boundSelectionChange: (() => void) | null = null;
   private selectionMenuTimer: number | null = null;
+  /** 移动端：点按已有标注（无选区）→ 弹清除菜单。 */
+  private boundAnnotationTap: ((e: MouseEvent) => void) | null = null;
   /**
    * 选区静置多久才算「选完了」。
    *
@@ -255,6 +257,10 @@ export class PDFPatcher {
     if (isMobileUI(this.plugin)) {
       this.boundSelectionChange = () => this.onSelectionChange();
       document.addEventListener('selectionchange', this.boundSelectionChange);
+      // 移动端「点按已有标注 → 清除菜单」：真机反馈在移动端没有右键入口，
+      // 已有的高亮 / 划线 / 批注清除不出去（只能进侧边栏删）。点按是第二入口。
+      this.boundAnnotationTap = (e: MouseEvent) => this.onAnnotationTap(e);
+      document.addEventListener('click', this.boundAnnotationTap, true);
     }
 
     // 监听 file-open（文件切换时触发）
@@ -1233,6 +1239,30 @@ export class PDFPatcher {
     return ids;
   }
 
+  /**
+   * 移动端点按已有标注 → 弹清除菜单（桌面端的对应入口是右键）。
+   *
+   * 触发条件从严，避免误弹：
+   *   ① 命中处必须真的有标注层（由内向外收集，叠加标注逐层列出）；
+   *   ② 当前无文字选区 —— 选区语义交给 selectionchange 菜单；
+   *   ③ 不抢批注气泡自己的交互（它有独立的删除菜单）；
+   *   ④ 只认 textLayer 里的命中，我们的面板 / 弹窗 / 按钮一律放行。
+   */
+  private onAnnotationTap(e: MouseEvent) {
+    if (!this.isInPDFView(e.target)) return;
+    const el = e.target as HTMLElement | null;
+    if (!el?.closest) return;
+    if (el.closest('.fleur-comment-bubble, .fleur-context-panel, .modal-container, button, a')) return;
+    if (!el.closest('.textLayer')) return;
+    const selection = window.getSelection();
+    if (selection && !selection.isCollapsed && selection.toString().trim()) return;
+    const ids = this.collectAnnotationIdsAt(e.target);
+    if (ids.length === 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    void this.showClearAnnotationMenu(e.clientX, e.clientY, ids);
+  }
+
   /** 无选区右键命中标注 → 原生菜单分层列出清除项（与批注气泡右键菜单风格一致） */
   private async showClearAnnotationMenu(x: number, y: number, annIds: string[]) {
     const file = this.plugin.app.workspace.getActiveFile();
@@ -2178,6 +2208,10 @@ export class PDFPatcher {
     if (this.boundSelectionChange) {
       document.removeEventListener('selectionchange', this.boundSelectionChange);
       this.boundSelectionChange = null;
+    }
+    if (this.boundAnnotationTap) {
+      document.removeEventListener('click', this.boundAnnotationTap, true);
+      this.boundAnnotationTap = null;
     }
     // 0.5 起不再有 touchstart / touchmove / touchend 的菜单相关监听
     // （随「手势静默期」一并移除，见 onSelectionChange 的说明）

@@ -1479,6 +1479,31 @@ body.fleur-pdf-mobile .fleur-pdf-ink-group {
   gap: 2px;
 }
 
+/* 笔盒拖把手：克制、贴组内左缘，不与按钮争夺注意力。
+   touch-action:none —— 把手上的手势归我们（拖动笔盒），浏览器别接管。 */
+body.fleur-pdf-mobile .fleur-pdf-ink-grip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 40px;
+  margin-left: 2px;
+  border-radius: 18px;
+  color: var(--text-faint);
+  cursor: grab;
+  touch-action: none;
+}
+
+body.fleur-pdf-mobile .fleur-pdf-ink-grip .svg-icon {
+  width: 15px;
+  height: 15px;
+}
+
+body.fleur-pdf-mobile .fleur-pdf-ink-bar.is-dragging {
+  opacity: 0.94;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.22);
+}
+
 body.fleur-pdf-mobile .fleur-pdf-ink-btn {
   position: relative;
   width: 40px;

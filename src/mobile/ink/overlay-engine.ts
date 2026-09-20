@@ -110,6 +110,10 @@ interface ActiveGesture {
 	// scroll（手指滚动）
 	scrollLast?: { x: number; y: number };
 	scrollEl?: HTMLElement | null;
+	/** 松手惯性用的速度（CSS px/ms，EMA 平滑；向下/向右为正）。 */
+	scrollVel?: { x: number; y: number };
+	/** 上一个 scroll move 事件的时间戳（算瞬时速度用）。 */
+	scrollTime?: number;
 }
 
 /** 套索选区（PDF 用户空间矩形）。 */
@@ -229,6 +233,9 @@ export class InkOverlayEngine {
 	private paintPending = new Set<number>();
 	private paintScheduled = false;
 
+	/** 松手惯性滚动的 rAF 句柄（null = 没有惯性动画在进行）。 */
+	private momentumRaf: number | null = null;
+
 	constructor(app: App) {
 		this.app = app;
 	}
@@ -264,6 +271,7 @@ export class InkOverlayEngine {
 	detach(): void {
 		if (this.cancelTimer !== null) window.clearTimeout(this.cancelTimer);
 		this.cancelTimer = null;
+		this.cancelMomentum();
 		// 手势进行中强撤：不提交（正常路径 InkUI 会先 flushActiveStroke）
 		this.active = null;
 		document.removeEventListener('pointerdown', this.onPointerDown, { capture: true } as any);
@@ -594,6 +602,7 @@ export class InkOverlayEngine {
 
 		// 笔 / 鼠标。若手指滚动正在进行（掌缘先落、笔后到），滚动立即让位 —— 书写优先。
 		if (this.active?.tool.mode === 'scroll') this.finishGesture(false);
+		this.cancelMomentum();
 
 		if (!this.active) {
 			const sf = this.surfaceOfEvent(e);
@@ -629,12 +638,25 @@ export class InkOverlayEngine {
 		if (g.tool.mode === 'scroll') {
 			// 手指滚动：move 的位移直接灌给滚动容器（touch-action:none 后浏览器不管平移了）。
 			// 必须放在坐标转换之前 —— 手指经常滚出页面边界，cssToPdf 对界外返回 null。
+			const now = e.timeStamp || performance.now();
+			const dt = g.scrollTime !== undefined ? now - g.scrollTime : 0;
+			g.scrollTime = now;
+			const dx = e.clientX - (g.scrollLast?.x ?? e.clientX);
+			const dy = e.clientY - (g.scrollLast?.y ?? e.clientY);
+			g.scrollLast = { x: e.clientX, y: e.clientY };
 			g.moved = true;
 			if (g.scrollEl) {
-				g.scrollEl.scrollTop -= e.clientY - (g.scrollLast?.y ?? e.clientY);
-				g.scrollEl.scrollLeft -= e.clientX - (g.scrollLast?.x ?? e.clientX);
+				g.scrollEl.scrollTop -= dy;
+				g.scrollEl.scrollLeft -= dx;
 			}
-			g.scrollLast = { x: e.clientX, y: e.clientY };
+			// 速度 EMA（px/ms）—— 松手惯性就靠它。跟手阶段本身 1:1 位移不受影响。
+			// dt 过大（事件间隔异常，如被系统卡顿拉长）的采样不可信，跳过。
+			if (g.scrollVel && dt > 0 && dt < 120) {
+				const instX = -dx / dt;
+				const instY = -dy / dt;
+				g.scrollVel.x += (instX - g.scrollVel.x) * 0.25;
+				g.scrollVel.y += (instY - g.scrollVel.y) * 0.25;
+			}
 			return;
 		}
 		const sf = g.surface;
@@ -645,11 +667,13 @@ export class InkOverlayEngine {
 			g.eraseChanged = this.eraseAt(sf, pdf.x, pdf.y, g.tool.radius) || g.eraseChanged;
 			this.drawEraserCursor(sf, css.x, css.y);
 		} else if (g.tool.mode === 'lasso') {
-			if (g.stroke) {
-				// move 模式：拖动已选中笔迹
+			// ⚠️ move 模式的判定必须是 g.moveMode。此前写成 g.stroke 是真 bug：
+			// stroke 只在钢笔工具下才有值，套索拖动永远走不进 previewMove ——
+			// 真机表现正是「套索选中之后，区域内的手写不跟随移动」。
+			if (g.moveMode) {
 				this.previewMove(g, pdf);
 			} else if (g.lassoStart) {
-				g.lassoStart !== undefined && this.drawLassoRect(sf, g.lassoStart, pdf);
+				this.drawLassoRect(sf, g.lassoStart, pdf);
 				g.moved = true;
 				g.lastRaw = pdf;
 			}
@@ -696,6 +720,8 @@ export class InkOverlayEngine {
 	 * 不做快照、不入 undo —— 滚动不产生数据变更。
 	 */
 	private beginScrollGesture(e: PointerEvent, sf: Surface): void {
+		// 上一轮惯性还在滑就被新触摸接住 —— 立刻停掉，跟手优先
+		this.cancelMomentum();
 		this.active = {
 			pointerId: e.pointerId,
 			pointerType: e.pointerType,
@@ -705,7 +731,51 @@ export class InkOverlayEngine {
 			snapshot: new Map(),
 			scrollLast: { x: e.clientX, y: e.clientY },
 			scrollEl: this.findScrollable(sf.el),
+			scrollVel: { x: 0, y: 0 },
 		};
+	}
+
+	/** 取消进行中的惯性滚动（新手势开始 / 卸载前调用）。 */
+	private cancelMomentum(): void {
+		if (this.momentumRaf !== null) {
+			window.cancelAnimationFrame(this.momentumRaf);
+			this.momentumRaf = null;
+		}
+	}
+
+	/**
+	 * 松手后的惯性 fling：以释放时刻的速度做指数衰减（每帧 ~6%），
+	 * 速度低于阈值或撞到滚动边界即停。这是浏览器原生滚动的标配手感，
+	 * touch-action:none 接管平移后必须自己补上 —— 缺了它就是
+	 * 「文本批注顺滑、手写批注发涩」的主诉。
+	 */
+	private startMomentum(vx: number, vy: number, el: HTMLElement): void {
+		this.cancelMomentum();
+		const STOP_SPEED = 0.02; // px/ms，低于即视为停稳
+		let last = performance.now();
+		let velX = vx;
+		let velY = vy;
+		const step = (now: number): void => {
+			this.momentumRaf = null;
+			const dt = Math.min(48, now - last);
+			last = now;
+			const beforeY = el.scrollTop;
+			const beforeX = el.scrollLeft;
+			if (velY) el.scrollTop += velY * dt;
+			if (velX) el.scrollLeft += velX * dt;
+			// 写了位移但 scrollTop 纹丝不动 = 已撞到边界 → 该轴停
+			if (velY !== 0 && el.scrollTop === beforeY) velY = 0;
+			if (velX !== 0 && el.scrollLeft === beforeX) velX = 0;
+			const decay = Math.pow(0.94, dt / 16.7);
+			velX *= decay;
+			velY *= decay;
+			// 双轴都低于停速（含撞边置 0）才算完
+			if (Math.abs(velX) < STOP_SPEED && Math.abs(velY) < STOP_SPEED) {
+				return;
+			}
+			this.momentumRaf = window.requestAnimationFrame(step);
+		};
+		this.momentumRaf = window.requestAnimationFrame(step);
 	}
 
 	/** 从页面向上找第一个真正可滚动的祖先（Obsidian 移动端 PDF 视图的滚动容器）。 */
@@ -796,7 +866,17 @@ export class InkOverlayEngine {
 		document.body.removeClass('fleur-pdf-ink-stroking');
 		const sf = g.surface;
 
-		if (g.tool.mode === 'scroll') return; // 滚动无数据变更，无需收尾
+		if (g.tool.mode === 'scroll') {
+			// 正常抬手（commit）且有速度 → 起惯性 fling；cancel / 没动过不起。
+			// 阈值 0.08 px/ms ≈ 80px/s：低于它视作「停住再松手」，不该滑出去。
+			if (commit && g.scrollEl && g.moved && g.scrollVel) {
+				const v = g.scrollVel;
+				if (Math.abs(v.x) > 0.08 || Math.abs(v.y) > 0.08) {
+					this.startMomentum(v.x, v.y, g.scrollEl);
+				}
+			}
+			return; // 滚动无数据变更，无需收尾
+		}
 
 		if (g.tool.mode === 'pen' && g.stroke) {
 			const stroke = g.stroke;
@@ -1155,6 +1235,9 @@ export class InkOverlayEngine {
 		const list = this.pages.get(sf.page);
 		if (!list) return;
 		for (const s of list) this.paintStroke(ctx, sf, s);
+		// 选区框画在 draft 层，而 paintPage 每次都清 draft —— 套索拖动中每次
+		// requestPaint 重绘都会把框抹掉。这里补画一次，拖动全程框不消失。
+		if (this.selection?.page === sf.page) this.drawSelection(sf);
 	}
 
 	private paintStroke(ctx: CanvasRenderingContext2D, sf: Surface, s: InkStroke): void {

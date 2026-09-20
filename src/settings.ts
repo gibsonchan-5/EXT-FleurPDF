@@ -86,6 +86,13 @@ export interface FleurSettings {
   inkShowInkSeg?: boolean;
   inkShowSideSeg?: boolean;
 
+  /**
+   * 手写笔盒（落墨时弹出的工具胶囊）的拖动位置。
+   * 存的是**笔盒中心的视口比例**（0~1）—— 与切换器同理，像素会随设备/转屏失效，比例不会。
+   * 缺省（未拖过）= CSS 默认位置（底部居中）。
+   */
+  inkBarPos?: { x: number; y: number };
+
   /** 隐藏左侧栏的 FleurPDF 图标（全局生效，桌面端与移动端同一条规则）。 */
   hideRibbonIcon?: boolean;
 }
