@@ -6,7 +6,7 @@
 //   2. 每页内：DOM 交集遍历定位 segments；失败则降级为文本匹配
 //   3. 应用时 segments 若已失效（节点被 PDF.js 重渲染），按页内文本重新匹配
 //   4. 恢复时：跨页标注先按页切分文本，再逐页匹配
-import { Menu, Modal, Notice } from 'obsidian';
+import { Menu, Modal, Notice, setIcon } from 'obsidian';
 import type FleurPDFPlugin from './main';
 import type { Annotation } from './types';
 import { AIChatPanel } from './ai-chat-modal';
@@ -1062,6 +1062,13 @@ export class PDFPatcher {
     /** 关闭当前面板（各按钮动作完成后统一走它，保证 openPanel 被清空）。 */
     const close = () => this.hideContextMenu();
 
+    // 拖拽把手：菜单默认贴着选区弹出，可能挡住正文或选区滑杆 —— 用户可拖走。
+    // 只认把手，按钮区交互不受影响（与手写笔盒的把手语义一致）。
+    const grip = panel.createDiv('fleur-context-grip');
+    setIcon(grip, 'grip-vertical');
+    grip.setAttribute('aria-label', '拖动菜单');
+    this.attachPanelDrag(panel, grip);
+
     // 复制
     const copyBtn = panel.createEl('button');
     copyBtn.addClass('fleur-context-item');
@@ -1220,6 +1227,57 @@ export class PDFPatcher {
     panel.setCssStyles({ left: `${posX}px`, top: `${posY}px` });
   }
 
+  /**
+   * 选区菜单面板拖拽（只认把手）。
+   *
+   * pointer capture 拖动：move 里按「起点面板位置 + 指针位移」重设 left/top，
+   * 并夹紧到视口内（留 8px 边距）。不持久化 —— 面板随选区即时重建，
+   * 每次弹出都回到默认位置，拖动只是当次的临时避让。
+   */
+  private attachPanelDrag(panel: HTMLElement, grip: HTMLElement): void {
+    let dragging = false;
+    let pointerId = -1;
+    let startX = 0;
+    let startY = 0;
+    let baseX = 0;
+    let baseY = 0;
+
+    grip.addEventListener('pointerdown', (e) => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      dragging = true;
+      pointerId = e.pointerId;
+      const rect = panel.getBoundingClientRect();
+      startX = e.clientX;
+      startY = e.clientY;
+      baseX = rect.left;
+      baseY = rect.top;
+      // touch-action: none（见样式）已挡掉触摸滚动，capture 保证指针移出把手也继续收事件
+      grip.setPointerCapture(e.pointerId);
+      e.preventDefault();
+      e.stopPropagation();
+    });
+    grip.addEventListener('pointermove', (e) => {
+      if (!dragging || e.pointerId !== pointerId) return;
+      const w = panel.offsetWidth;
+      const h = panel.offsetHeight;
+      const nx = Math.min(Math.max(8, baseX + (e.clientX - startX)), window.innerWidth - w - 8);
+      const ny = Math.min(Math.max(8, baseY + (e.clientY - startY)), window.innerHeight - h - 8);
+      panel.setCssStyles({ left: `${nx}px`, top: `${ny}px` });
+      e.preventDefault();
+    });
+    const end = (e: PointerEvent) => {
+      if (!dragging || e.pointerId !== pointerId) return;
+      dragging = false;
+      try {
+        grip.releasePointerCapture(e.pointerId);
+      } catch {
+        /* 指针已释放，忽略 */
+      }
+    };
+    grip.addEventListener('pointerup', end);
+    grip.addEventListener('pointercancel', end);
+  }
+
   // ════════════════════════════════════════════
   //  右键一键清除标注 — 点击标注区域内任意位置即可，无需选中
   // ════════════════════════════════════════════
@@ -1250,6 +1308,9 @@ export class PDFPatcher {
    */
   private onAnnotationTap(e: MouseEvent) {
     if (!this.isInPDFView(e.target)) return;
+    // 手写批注模式下，点按属于墨迹引擎（落笔 / 擦除 / 套索 / 滚动），
+    // 永不弹文本标注清除菜单 —— 真机反馈「点手写笔迹也弹出清除高亮窗口」。
+    if (document.body.hasClass('fleur-pdf-ink-active')) return;
     const el = e.target as HTMLElement | null;
     if (!el?.closest) return;
     if (el.closest('.fleur-comment-bubble, .fleur-context-panel, .modal-container, button, a')) return;
@@ -1285,6 +1346,22 @@ export class PDFPatcher {
     if (ann.type === 'underline') return ann.underlineStyle === 'wavy' ? '清除波浪线' : '清除直线';
     if (ann.type === 'comment') return '清除批注';
     return '清除标注';
+  }
+
+  /**
+   * 波浪线背景（SVG 波形平铺）。
+   *
+   * 为什么不用 text-decoration-style: wavy：部分 Android WebView 在
+   * textLayer 的小号字体 + 变换缩放下，wavy 装饰会退化成不成规则的点
+   * （真机反馈「下划波浪线没有波浪，都是点」）。改用自绘正弦波 SVG
+   * 作为背景平铺，颜色经 data URI 烧进图里 —— CSS 变量进不了 SVG，
+   * 所以随样式一起写入 --fleur-wavy-bg，与 --fleur-underline-color 同源。
+   */
+  private wavyUnderlineBg(color: string): string {
+    const svg =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="8" height="4" viewBox="0 0 8 4">' +
+      `<path d="M0 2 Q2 0 4 2 T8 2" fill="none" stroke="${color}" stroke-width="1.2"/></svg>`;
+    return `url("data:image/svg+xml,${encodeURIComponent(svg)}")`;
   }
 
   /** 从存储与 DOM 中移除一条标注（含跨页全部片段、批注气泡），并刷新侧边栏 */
@@ -1439,7 +1516,9 @@ export class PDFPatcher {
     const styleFn = (el: HTMLElement) => {
       el.addClass('fleur-underline');
       el.addClass(style === 'wavy' ? 'fleur-underline-wavy' : 'fleur-underline-solid');
-      el.setCssProps({ '--fleur-underline-color': color });
+      const props: Record<string, string> = { '--fleur-underline-color': color };
+      if (style === 'wavy') props['--fleur-wavy-bg'] = this.wavyUnderlineBg(color);
+      el.setCssProps(props);
       el.dataset['annId'] = annId;
     };
     let spans = this.styleAllPages(pages, styleFn);

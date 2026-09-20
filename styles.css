@@ -987,10 +987,16 @@
   box-decoration-break: clone;
 }
 
+/* 波浪线不用 text-decoration-style: wavy —— 部分 Android WebView 在 textLayer
+   的小号字体 + 变换缩放下会把 wavy 退化成不成规则的点（真机反馈）。
+   改用自绘正弦波 SVG（由 patcher 按划线颜色生成）平铺在文字底部。
+   颜色进不了 CSS 变量与 SVG 的组合，所以随 --fleur-wavy-bg 内联下发。 */
 .fleur-underline-wavy {
-  text-decoration: underline;
-  text-decoration-style: wavy;
-  text-decoration-color: var(--fleur-underline-color, #E8590C);
+  text-decoration: none;
+  background-image: var(--fleur-wavy-bg, none);
+  background-repeat: repeat-x;
+  background-position: 0 100%;
+  background-size: 8px 4px;
 }
 
 .fleur-underline-solid {
@@ -1065,6 +1071,37 @@
 .fleur-context-group {
   display: flex;
   gap: 3px;
+}
+
+/* 菜单拖拽把手：只认把手拖动，按钮区不受影响（与手写笔盒把手同语义）。
+   touch-action: none 防止触摸拖动时页面跟着滚。 */
+.fleur-context-grip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  align-self: stretch;
+  cursor: grab;
+  touch-action: none;
+  color: var(--text-faint);
+  border-radius: 4px;
+}
+
+.fleur-context-grip:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-muted);
+}
+
+.fleur-context-grip:active {
+  cursor: grabbing;
+}
+
+.fleur-context-grip svg {
+  display: block;
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+  pointer-events: none;
 }
 
 /* 高亮颜色圆点 —— 元素是 SVG（见 patcher.ts）。
@@ -1772,8 +1809,9 @@ body.fleur-pdf-mobile .fleur-context-panel {
   border-radius: 10px;
   /* 0.6.0 真机反馈：单行 ~350px 在窄屏/分屏下左右图标被截断（overflow-x 滚动
      也只是把截断变成「要滑动才能看到」）。改为两行自动换行 + 收窄上限，
-     所有图标一次可见。9 个 32px 按钮按 5+4 分两行 ≈ 176px 宽。 */
-  max-width: 188px;
+     所有图标一次可见。9 个 32px 按钮按 5+4 分两行 ≈ 176px 宽。
+     0.6.3 加左端拖拽把手（16px），上限随之放宽。 */
+  max-width: 204px;
   flex-wrap: wrap;
   justify-content: center;
   row-gap: 3px;

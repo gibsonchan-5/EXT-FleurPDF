@@ -955,7 +955,7 @@ export class SidebarView extends ItemView {
       // 「先定位后删除」时残留该 class 会让片段继续涂色（小片段表现为像素点）
       el.removeClass('fleur-highlight', 'fleur-underline', 'fleur-underline-wavy', 'fleur-underline-solid', 'fleur-search-flash');
       el.setCssStyles({ background: '', borderRadius: '', textDecoration: '', textUnderlineOffset: '' });
-      el.setCssProps({ '--fleur-underline-color': '' });
+      el.setCssProps({ '--fleur-underline-color': '', '--fleur-wavy-bg': '' });
       delete el.dataset['annId'];
     };
 
