@@ -922,10 +922,9 @@ export class SidebarView extends ItemView {
             const fg = pickReadableFg(hlColor);
             md += `<span style="background-color:${hlColor};color:${fg};padding:0 2px;border-radius:2px">${annText}</span>\n\n`;
           } else if (ann.type === 'underline') {
-            // 划线：保留 PDF 中的具体下划线颜色，wavy 用波浪线
+            // 划线：保留 PDF 中的具体下划线颜色。波浪线已移除，历史 wavy 数据也按 solid 导出
             const ulColor = ann.color || '#E8590C';
-            const style = ann.underlineStyle === 'wavy' ? 'wavy' : 'solid';
-            md += `<span style="text-decoration:underline;text-decoration-color:${ulColor};text-decoration-style:${style}">${annText}</span>\n\n`;
+            md += `<span style="text-decoration:underline;text-decoration-color:${ulColor};text-decoration-style:solid">${annText}</span>\n\n`;
           } else {
             md += `<span style="color:var(--text-muted)">${annText}</span>\n\n`;
           }

@@ -112,13 +112,6 @@ function iconUnderlineSolid(c: Node, color: string) {
   svg.classList.add('fleur-context-ul');
   return svg;
 }
-function iconUnderlineWavy(c: Node, color: string) {
-  const svg = svgIcon(c, color, [
-    { tag: 'path', attrs: { d: 'M3 18 Q6 12, 9 18 T15 18 T21 18' } },
-  ]);
-  svg.classList.add('fleur-context-ul');
-  return svg;
-}
 function iconComment(c: Node) {
   return svgIcon(c, 'currentColor', [
     { tag: 'path', attrs: { d: 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z' } },
@@ -613,8 +606,9 @@ export class PDFPatcher {
         const ulColor = ann.color || '#E8590C';
         allSegments.forEach((seg) => {
           this.wrapAndStyle(seg, (el) => {
+            // 波浪线已移除：历史 wavy 数据统一按 solid 渲染（数据字段只读兼容）
             el.addClass('fleur-underline');
-            el.addClass(ann.underlineStyle === 'wavy' ? 'fleur-underline-wavy' : 'fleur-underline-solid');
+            el.addClass('fleur-underline-solid');
             el.setCssProps({ '--fleur-underline-color': ulColor });
             el.dataset['annId'] = ann.id;
           });
@@ -1124,17 +1118,7 @@ export class PDFPatcher {
     solidUlBtn.title = '直线';
     iconUnderlineSolid(solidUlBtn, underlineColor);
     solidUlBtn.addEventListener('click', () => {
-      void this.applyUnderline(text, pageNum, pages, 'solid', underlineColor, filePath, endPage);
-      close();
-    });
-
-    // 划线 - 波浪
-    const wavyUlBtn = panel.createEl('button');
-    wavyUlBtn.addClass('fleur-context-item');
-    wavyUlBtn.title = '波浪';
-    iconUnderlineWavy(wavyUlBtn, underlineColor);
-    wavyUlBtn.addEventListener('click', () => {
-      void this.applyUnderline(text, pageNum, pages, 'wavy', underlineColor, filePath, endPage);
+      void this.applyUnderline(text, pageNum, pages, underlineColor, filePath, endPage);
       close();
     });
 
@@ -1343,25 +1327,9 @@ export class PDFPatcher {
   private describeAnnotation(ann?: Annotation): string {
     if (!ann) return '清除标注';
     if (ann.type === 'highlight') return '清除高亮';
-    if (ann.type === 'underline') return ann.underlineStyle === 'wavy' ? '清除波浪线' : '清除直线';
+    if (ann.type === 'underline') return '清除直线';
     if (ann.type === 'comment') return '清除批注';
     return '清除标注';
-  }
-
-  /**
-   * 波浪线背景（SVG 波形平铺）。
-   *
-   * 为什么不用 text-decoration-style: wavy：部分 Android WebView 在
-   * textLayer 的小号字体 + 变换缩放下，wavy 装饰会退化成不成规则的点
-   * （真机反馈「下划波浪线没有波浪，都是点」）。改用自绘正弦波 SVG
-   * 作为背景平铺，颜色经 data URI 烧进图里 —— CSS 变量进不了 SVG，
-   * 所以随样式一起写入 --fleur-wavy-bg，与 --fleur-underline-color 同源。
-   */
-  private wavyUnderlineBg(color: string): string {
-    const svg =
-      '<svg xmlns="http://www.w3.org/2000/svg" width="8" height="4" viewBox="0 0 8 4">' +
-      `<path d="M0 2 Q2 0 4 2 T8 2" fill="none" stroke="${color}" stroke-width="1.2"/></svg>`;
-    return `url("data:image/svg+xml,${encodeURIComponent(svg)}")`;
   }
 
   /** 从存储与 DOM 中移除一条标注（含跨页全部片段、批注气泡），并刷新侧边栏 */
@@ -1505,20 +1473,25 @@ export class PDFPatcher {
     return annId;
   }
 
+  /**
+   * 应用直线标注。
+   *
+   * 波浪线已移除（真机反馈：Android WebView 的 text-decoration:wavy 渲染成
+   * 不规则点，SVG 背景方案实测仍不达标，用户拍板砍掉）。历史数据里的
+   * underlineStyle: 'wavy' 恢复时统一按 solid 渲染，数据字段保留只读兼容。
+   */
   private async applyUnderline(
     text: string, pageNum: number, pages: PageSelection[],
-    style: UnderlineStyle, color: string,
+    color: string,
     filePath?: string | null, endPage?: number
   ): Promise<string> {
-    const annId = await this.saveAnnotation(text, pageNum, color, 'underline', undefined, style, filePath, endPage, computeSelectionPos(pages));
+    const annId = await this.saveAnnotation(text, pageNum, color, 'underline', undefined, 'solid', filePath, endPage, computeSelectionPos(pages));
     if (!annId) return '';
 
     const styleFn = (el: HTMLElement) => {
       el.addClass('fleur-underline');
-      el.addClass(style === 'wavy' ? 'fleur-underline-wavy' : 'fleur-underline-solid');
-      const props: Record<string, string> = { '--fleur-underline-color': color };
-      if (style === 'wavy') props['--fleur-wavy-bg'] = this.wavyUnderlineBg(color);
-      el.setCssProps(props);
+      el.addClass('fleur-underline-solid');
+      el.setCssProps({ '--fleur-underline-color': color });
       el.dataset['annId'] = annId;
     };
     let spans = this.styleAllPages(pages, styleFn);

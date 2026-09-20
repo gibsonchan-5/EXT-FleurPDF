@@ -44,6 +44,15 @@ const CANCEL_GRACE_MS = 400;
 /** 笔活动后多久内拒绝一切 touch（防掌压把页面滚走）。 */
 const PEN_TOUCH_REJECTION_MS = 1200;
 
+/**
+ * 掌腹接触面判定阈值（CSS px）：touch 指针上报的接触面（width/height）
+ * 任一边超过此值视为掌腹（大鱼际 / 掌缘），即使不在笔活动窗口内也不启动
+ * 指滚 —— 掌腹先落、笔后到时悬停信号可能来不及先到，这是第二道网。
+ * 参照 mobile-ink-annotation 的 hasFineContact（其细接触上限 18px），
+ * 此处放宽到 24：只拦掌腹，尽量不误伤大指尖的滚动。
+ */
+const PALM_CONTACT_MAX_PX = 24;
+
 /** 位置 EMA 系数（0.7 = 轻度平滑：压掉数字笔的高频抖动，几乎无迟滞）。 */
 const POSITION_ALPHA = 0.7;
 
@@ -594,6 +603,10 @@ export class InkOverlayEngine {
 			// 手指只滚动，永不落墨（画 / 擦 / 套索是笔和鼠标的活）。
 			// 笔活动窗口内的 touch 一律视为掌压 → 无视，防止书写时掌缘把页面拖走。
 			if (this.active || performance.now() < this.penActivityUntil) return;
+			// 接触面判据：掌腹（大鱼际 / 掌缘）即使在笔活动窗口外也拒止
+			//（部分设备上报 0 表示未知尺寸，此时不猜，放行走正常路径）。
+			const contact = Math.max(e.width ?? 0, e.height ?? 0);
+			if (contact > 0 && contact > PALM_CONTACT_MAX_PX) return;
 			const sf = this.surfaceOfEvent(e);
 			if (!sf) return;
 			this.beginScrollGesture(e, sf);
@@ -625,6 +638,14 @@ export class InkOverlayEngine {
 	};
 
 	private onPointerMove = (e: PointerEvent): void => {
+		// 笔悬停（未接触，悬空 ~1cm 即发 pointermove）也要刷新笔活动窗口 ——
+		// 这是成熟软件（Samsung Notes / OneNote）pen-first 拒掌的通用做法：
+		// 大鱼际先落、笔后到的空档里，掌压 touch 一律无视。悬停一出现，
+		// 进行中的指滚手势立即让位（书写意图已明确）。
+		if (e.pointerType === 'pen') {
+			this.penActivityUntil = performance.now() + PEN_TOUCH_REJECTION_MS;
+			if (this.active?.tool.mode === 'scroll') this.finishGesture(false);
+		}
 		const g = this.active;
 		if (!g || e.pointerId !== g.pointerId) return;
 		e.preventDefault();

@@ -987,18 +987,6 @@
   box-decoration-break: clone;
 }
 
-/* 波浪线不用 text-decoration-style: wavy —— 部分 Android WebView 在 textLayer
-   的小号字体 + 变换缩放下会把 wavy 退化成不成规则的点（真机反馈）。
-   改用自绘正弦波 SVG（由 patcher 按划线颜色生成）平铺在文字底部。
-   颜色进不了 CSS 变量与 SVG 的组合，所以随 --fleur-wavy-bg 内联下发。 */
-.fleur-underline-wavy {
-  text-decoration: none;
-  background-image: var(--fleur-wavy-bg, none);
-  background-repeat: repeat-x;
-  background-position: 0 100%;
-  background-size: 8px 4px;
-}
-
 .fleur-underline-solid {
   text-decoration: underline;
   text-decoration-style: solid;
