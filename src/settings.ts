@@ -551,21 +551,13 @@ export class FleurSettingTab extends PluginSettingTab {
     const inkSection = containerEl.createDiv('fleurpdf-settings-section');
     new Setting(inkSection).setHeading().setName('移动端手写批注');
 
-    new Setting(inkSection)
-      .setName('手指滚动（防误触）')
-      .setDesc('手写模式下手指滑动只滚动页面，Apple Pencil 等触控笔才落墨。关闭后手指也可以直接书写、擦除。')
-      .addToggle(toggle => toggle
-        .setValue(this.plugin.settings.inkFingerScroll !== false)
-        .onChange(async (value) => {
-          this.plugin.settings.inkFingerScroll = value;
-          await this.plugin.saveSettings();
-        }));
+    // 「手指滚动」设置项已随 0.6.0 覆盖层架构移除：手指滚动现在是浏览器原生行为
+    // （覆盖层 canvas 的 touch-action 放行平移，touch 永不落墨），没有可关的东西。
 
     new Setting(inkSection)
       .setName('默认擦除模式')
-      .setDesc('像素擦除：切掉扫过的部分，保留其余线段；笔画擦除：触到哪笔删哪笔；选区擦除：拖一个矩形，相交的笔画整笔删除。')
+      .setDesc('笔画擦除：触到哪笔删哪笔；选区擦除：拖一个矩形，相交的笔画整笔删除。')
       .addDropdown(dropdown => dropdown
-        .addOption('pixel', '像素擦除')
         .addOption('stroke', '笔画擦除')
         .addOption('select', '选区擦除')
         .setValue(this.plugin.settings.inkEraserMode ?? 'stroke')

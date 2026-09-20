@@ -1838,3 +1838,26 @@ body.fleur-pdf-mobile .fleur-sidebar-icon-btn {
 .fleur-pdf-ribbon-hidden {
   display: none !important;
 }
+
+/* ============================================================
+   手写批注覆盖层（0.6.0 自绘引擎）
+   ------------------------------------------------------------
+   committed 层接收输入并常驻显示；draft 层只放进行中的预览
+   （荧光笔 / 橡皮光标 / 套索框），不接收事件。
+   touch-action 默认放行平移 —— 手指滚动走浏览器原生路径，
+   笔不受 touch-action 影响；正在运笔时由
+   body.fleur-pdf-ink-stroking 全面禁掉，防掌压滚动。
+   ============================================================ */
+.fleur-ink-canvas {
+  position: absolute;
+  inset: 0;
+  touch-action: pan-x pan-y;
+  z-index: 3;
+}
+.fleur-ink-canvas.is-draft {
+  pointer-events: none;
+  z-index: 4;
+}
+body.fleur-pdf-ink-stroking .fleur-ink-canvas {
+  touch-action: none;
+}

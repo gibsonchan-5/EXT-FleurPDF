@@ -1,38 +1,26 @@
-// 移动端手写批注的 UI 层：模式切换 + 笔盒 + 手指滚动（触摸路由）。
+// 手写批注的 UI 层：悬浮切换器 + 笔盒 + 落盘调度。
 //
-// 设计原则（对齐 fleur-pdf 既有设计语言与 FleurEPUB 的移动端做法）：
-//   · 只在 isMobileUI() 为真时创建，桌面端不实例化、不注入样式；
-//   · pdf.js 原生的 editToolbar 整块隐藏，UI 全部换成自己的；
-//   · 手写模式是一个「模式」，与原有的文本批注编辑模式并列切换，互不干扰。
+// ⚠️ **0.6.0 架构切换说明。** 输入接管 / 橡皮 / 套索 / 手势盾 / 触摸路由全部
+// 移入覆盖层引擎（ink/overlay-engine.ts）—— 那一层的复杂度曾在这里堆了上千行，
+// 且全部建立在「笔迹活在 pdf.js 编辑器表里」这个前提上，正是真机四个顽疾的根源。
+// 现在本文件只做三件事：
+//   ① 悬浮切换器与笔盒（视觉与交互，沿袭 0.5 的三态胶囊 + 显隐设置）；
+//   ② 进入 / 退出手写模式时把覆盖层引擎挂上 / 摘下，并恢复历史笔迹；
+//   ③ 落盘调度（空闲防抖 + 退出落盘 + 切文件兜底 + 切后台抢存）。
 //
-// R9（手写模式独占触摸）是本层必须自建的东西：
-//   实测确认手写模式下触摸被 pdf.js 独占，单指滑动 scrollTop 变化恒为 0。
-//   因此这里用「双指手势接管」：捕获阶段拦下第二个触点，取消已起手的绘制，
-//   然后自己驱动滚动。这比让用户「退出手写再滚」顺手得多。
+// 拿不到 UIManager 就「笔色/橡皮/撤销全废」的旧限制随编辑器架构一起消失 ——
+// 现在不依赖 pdf.js 的任何编辑器接口。
 
-import { Notice, setIcon, type TFile } from 'obsidian';
+import { Notice, setIcon } from 'obsidian';
 import type FleurPDFPlugin from '../main';
 import type { InkEngine, PenSpec } from './ink-engine';
-import { eraseAtPoint, eraseInRect, toPdfPoint, type EraseMode } from './ink-erase';
-import { lassoHitEditors, lassoPolyToPdf, moveEditorBy, screenBBoxOfEditors, type ScreenPoint } from './ink-lasso';
-import { InkStore, type InkEntry, type InkSidecar } from './ink-store';
+import { InkOverlayEngine, type InkTool } from './ink/overlay-engine';
+import { v1EntryToStroke, type InkStroke } from './ink/strokes';
+import { InkStore } from './ink-store';
 
 /**
- * PDF 视图的类名候选（仅作最后兜底）。
- *
- * ⚠️ 不要拿这个列表去 `querySelector` 取滚动容器 —— 真机实测（0.2.1 小米平板）：
- * Obsidian 的 `.pdf-container` 是**外层**（app.css 里 overflow: hidden），
- * `.pdf-viewer-container` 才是 overflow: auto 的滚动容器。querySelector 返回的是
- * DOM 里**靠前**的 `.pdf-container`，在它身上写 scrollTop 完全无效，
- * 用户感受就是「开启手写后整个界面定住、划不动」。滚动容器一律用
- * resolveScrollHost() 按可滚动能力向上探测。
- */
-const SCROLL_SELECTOR = '.pdf-viewer-container, .pdfViewer';
-
-/**
- * 首版四笔。钢笔与荧光笔同走墨迹通道（0.2.0 起，荧光笔 = 大笔触 + 半透明，
- * 不再走 pdf.js 自由高亮 —— 那条通道的 Outline 多边形渲染自带一圈描边）。
- * 荧光笔的半透明感来自 opacity 0.45（0.3.0 从 0.4 上调：真机反馈颜色太淡）。
+ * 首版四笔。钢笔与荧光笔同走墨迹通道；荧光笔的半透明感来自 opacity 0.45
+ * （0.3.0 从 0.4 上调：真机反馈颜色太淡）。
  */
 export const DEFAULT_PENS: PenSpec[] = [
 	{ kind: 'pen', color: '#1f1f1f', thickness: 3, opacity: 1 },
@@ -43,20 +31,12 @@ export const DEFAULT_PENS: PenSpec[] = [
 
 /** 钢笔可选色（沿用 fleur-pdf 已有的标注配色基调：深金 / 深蓝 / 深红）。 */
 const PEN_COLORS = ['#1f1f1f', '#D4A017', '#2979C4', '#D32F2F', '#2E7D32'];
-/**
- * 荧光笔可选色。
- *
- * 0.3.0 小米平板反馈：上一组（#ffe066 / #a5f3b0 / #9fd8ff / #ffb3c8 / #e0c3ff）
- * 配 opacity 0.4 在浅色正文上几乎看不出颜色。这里整体加深一档 ——
- * 仍然保持「能透出下面文字」的荧光笔语义，但颜色要真正立得住。
- */
+/** 荧光笔可选色（0.3.0 起整体加深一档，浅色正文上立得住）。 */
 const MARKER_COLORS = ['#f2c200', '#5fc93f', '#2f9fe0', '#ee5f86', '#a06edb'];
 
 /**
  * 笔触大小滑块的取值范围 [min, max, step]（PDF 用户空间单位）。
- *
- * 0.3.0 起由固定档位（原 PEN_SIZES / MARKER_SIZES / ERASER_SIZES）改为连续滑块：
- * 真机反馈「档位跨度太粗，想要的值调不出来」。滑块步长对钢笔取 0.5，其余取 1。
+ * 0.3.0 起由固定档位改为连续滑块；滑块步长对钢笔取 0.5，其余取 1。
  */
 const SIZE_RANGE: Record<PenSpec['kind'], [number, number, number]> = {
 	pen: [1, 12, 0.5],
@@ -67,22 +47,20 @@ const SIZE_RANGE: Record<PenSpec['kind'], [number, number, number]> = {
 
 /**
  * 停笔后多久静默落盘一次。
- *
- * ⚠️ 0.5 起落盘对象变了：**写插件自己的 JSON，不再写回 PDF**（见 ink-store.ts 的架构说明）。
- * 这一步很轻（几 KB 的 JSON，不重新序列化整份 PDF、不改写用户文件），
- * 所以从 4s 收紧到 1.5s —— 用户几乎不可能在 1.5 秒内完成「落笔 → 关闭文件」。
- *
- * 关键收益：写 JSON **不触碰 PDF**，Obsidian 不会因此销毁重建视图，
- * 也就不会出现「写回后内存里未写回的笔迹全丢」（真机反复反馈的掉笔迹）。
+ * 落盘对象是插件自己的 JSON（不触碰 PDF），写盘很轻 —— 1.5s 内用户几乎不可能
+ * 完成「落笔 → 关闭文件」。
  */
 const AUTO_SAVE_IDLE_MS = 1500;
 
-/** 擦除模式的展示名。 */
+/** 擦除模式的展示名（pixel 沿袭旧设置值，行为等同笔画擦除）。 */
 const ERASE_MODE_LABEL: Record<EraseMode, string> = {
-	pixel: '像素擦除',
+	pixel: '笔画擦除',
 	stroke: '笔画擦除',
 	select: '选区擦除',
 };
+
+/** 橡皮弹层里实际展示的模式（pixel 已并入笔画擦除，不再单独展示）。 */
+const ERASE_MODES: EraseMode[] = ['stroke', 'select'];
 
 /** 笔的种类 → 图标 / 无障碍名（lucide 图标名，Obsidian setIcon 消费）。 */
 const PEN_ICON: Record<PenSpec['kind'], string> = {
@@ -98,6 +76,8 @@ const PEN_LABEL: Record<PenSpec['kind'], string> = {
 	lasso: '套索',
 };
 
+type EraseMode = 'pixel' | 'stroke' | 'select';
+
 export class InkUI {
 	private toggleBtn: HTMLElement | null = null;
 	/** 双态切换器的两段：编辑 / 手写。 */
@@ -106,38 +86,27 @@ export class InkUI {
 	/** 第三段：批注列表（打开文本批注侧边栏）。 */
 	private sideSeg: HTMLElement | null = null;
 	private penBar: HTMLElement | null = null;
-	private scrollHost: HTMLElement | null = null;
-	private detachTwoFinger: (() => void) | null = null;
 
 	/** 是否处于手写模式。 */
 	private active = false;
-	/** 本次进入手写时是否拿不到 UIManager（笔参数/橡皮/撤销不可用，但书写仍可）。 */
-	private umMissing = false;
 	/** 当前选中的笔序号（对应 DEFAULT_PENS）。 */
 	private penIndex = 0;
-	/** 每支笔的当前参数（颜色/粗细按笔独立记忆，0.2.0 起持久化到插件设置）。 */
+	/** 每支笔的当前参数（颜色/粗细按笔独立记忆，持久化到插件设置）。 */
 	private readonly pens: PenSpec[];
-	/** 当前擦除模式（仅橡皮笔生效，0.2.0 起持久化）。 */
+	/** 当前擦除模式（仅橡皮笔生效，持久化）。 */
 	private eraserMode: EraseMode;
-	/** 笔迹的 sidecar 存储 —— 方案 C 的真相源（见 ink-store.ts 的架构说明）。 */
+	/** 覆盖层自绘引擎 —— 笔迹的唯一处理者（输入 / 渲染 / 擦除 / 套索 / 撤销）。 */
+	private readonly overlay: InkOverlayEngine;
+	/** 笔迹的 sidecar 存储 —— 真相源（见 ink-store.ts 的架构说明）。 */
 	private readonly inkStore: InkStore;
 	/** 上次落盘的内容指纹（JSON 字符串），用于判断「是否真有新内容要存」。 */
 	private lastSavedJson = '';
-	/**
-	 * 内存快照：最近一次「编辑器里有什么」以及它属于哪个文件。
-	 *
-	 * 存在的唯一理由：PDF 视图被销毁后，pdf.js 的编辑器对象随之消失，此时再调
-	 * exportStrokeEntries() 只会拿到空数组 —— 而「写完直接关文件」正是最自然的
-	 * 操作路径，最后那一两笔会变成孤儿（真机反复反馈的「掉笔迹」）。
-	 * 快照在每个改动点同步刷新（见 scheduleAutoSave），视图死掉后仍可补写进
-	 * sidecar（见 salvageSnapshot）。
-	 */
-	private lastFile: TFile | null = null;
-	private lastEntries: InkEntry[] | null = null;
+	/** 内存快照归属（视图销毁后 salvageSnapshot 用）。 */
+	private lastFile: import('obsidian').TFile | null = null;
+	private lastStrokes: InkStroke[] | null = null;
 	/**
 	 * 已接管过的固有注释 id 全集（只增不减），随每次落盘写回 sidecar。
-	 *
-	 * ⚠️ 每次 save 都必须把它带上：落盘是**整份覆盖**，漏传就等于把认领名单清空，
+	 * ⚠️ 每次 save 都必须带上：落盘是整份覆盖，漏传等于清空认领名单，
 	 * 用户擦掉的笔迹会在下次进入时从 PDF 原件里复活。
 	 */
 	private claimedIds = new Set<string>();
@@ -153,16 +122,14 @@ export class InkUI {
 		private engine: InkEngine,
 	) {
 		this.inkStore = new InkStore(plugin.app);
+		this.overlay = new InkOverlayEngine(plugin.app);
 		this.pens = InkUI.loadPens(plugin);
 		this.eraserMode = plugin.settings.inkEraserMode ?? 'stroke';
 	}
 
 	/* ============================ 设置持久化 ============================ */
 
-	/**
-	 * 从插件设置恢复笔参数。结构变化（笔数不符 / kind 对不上）时回落默认值，
-	 * 保证旧数据或手改的 data.json 不会让笔盒坏掉。
-	 */
+	/** 从插件设置恢复笔参数。结构变化时回落默认值，保证旧数据不会让笔盒坏掉。 */
 	private static loadPens(plugin: FleurPDFPlugin): PenSpec[] {
 		const saved = plugin.settings.inkPens;
 		if (
@@ -189,22 +156,15 @@ export class InkUI {
 		});
 	}
 
-	/** 手指滚动开关（实时读设置，设置页改动即时生效，无需重建 InkUI）。 */
-	private get fingerScroll(): boolean {
-		return this.plugin.settings.inkFingerScroll !== false;
-	}
-
 	/* ============================ 挂载 / 卸载 ============================ */
 
-	/** M3-A：挂载指引每次插件会话只提示一次（ InkUI 可能因开关切换被多次 mount/unmount）。 */
+	/** 挂载指引每次插件会话只提示一次（InkUI 可能因开关切换被多次 mount/unmount）。 */
 	private static mountHintShown = false;
 
 	mount(): void {
 		if (this.toggleBtn) return;
 
-		// M3-B：显式双态切换器（常驻胶囊，右下角）。替代原先那颗藏起来的 44px 单钮——
-		// 用户实测反馈「看不到变化」，根因就是入口可发现性太差。
-		// 编辑段 → 退出手写；手写段 → 进入手写。当前态高亮，两种模式下都常驻。
+		// 显式三态切换器（常驻胶囊，右下角）：编辑 / 手写 / 批注列表。
 		const sw = document.body.createDiv('fleur-pdf-ink-toggle');
 
 		const editBtn = sw.createDiv('fleur-pdf-ink-switch-btn');
@@ -222,16 +182,11 @@ export class InkUI {
 		inkBtn.addEventListener('click', (e) => {
 			e.preventDefault();
 			e.stopPropagation();
-			// 再点一次即退出：这样即便用户在设置里关掉了「编辑」段，
-			// 也仍有路走出写模式，不会被困住。
+			// 再点一次即退出：即便用户在设置里关掉了「编辑」段，也仍有路走出写模式。
 			if (this.active) void this.exitInk();
 			else void this.enterInk();
 		});
 
-		// 第三段：批注列表（原「双态」扩为三态）。
-		// 真机反馈「右侧边栏的批注窗口很难呼出」—— 此前只有 ribbon 图标与命令面板
-		// 两个入口，而移动端 ribbon 要展开左侧栏才看得见，等于没有入口。
-		// 挂到这颗常驻胶囊上，与手写/编辑同处一地，不进设置面板也能打开。
 		const sideBtn = sw.createDiv('fleur-pdf-ink-switch-btn');
 		setIcon(sideBtn, 'list');
 		sideBtn.setAttribute('aria-label', '批注列表');
@@ -256,9 +211,6 @@ export class InkUI {
 		document.body.addEventListener('click', this.onBodyClick, true);
 
 		// ── 离开当前 PDF 前的兜底落盘（见 autoSave）──
-		// 真机 0.4.0 反馈「手写批注之后关闭文件，重新回来全部批注都消失了」：
-		// 批注此前只活在 pdf.js 的内存 AnnotationStorage 里，唯一出口是笔盒上的
-		// 保存钮 —— 而「写完直接关文件」才是最自然的操作，于是必然丢。
 		this.plugin.registerEvent(
 			this.plugin.app.workspace.on('file-open', (file) => {
 				void this.flushBeforeLeave(file?.path ?? null);
@@ -272,9 +224,8 @@ export class InkUI {
 		);
 
 		// ── 切后台 / 页面卸载前的兜底落盘 ──
-		// 「写完直接杀掉 App」在移动端是高频操作。杀进程前一般会先切后台
-		// （iOS 上滑 / Android Home 键），visibilitychange → hidden 是最后一班
-		// 可靠的车；pagehide 再兜一层（部分 WebView 只派发它）。
+		// 「写完直接杀掉 App」在移动端是高频操作，visibilitychange → hidden 是
+		// 最后一班可靠的车；pagehide 再兜一层（部分 WebView 只派发它）。
 		this.onHiddenFlush = () => {
 			if (this.active) void this.autoSave(true);
 		};
@@ -282,10 +233,6 @@ export class InkUI {
 		window.addEventListener('pagehide', this.onHiddenFlush);
 
 		// ── 按当前视图同步悬浮胶囊的显隐 ──
-		// 胶囊挂在 body 上，原本与「当前打开的是什么文件」无关，于是在普通笔记里
-		// 也照常浮着 —— 真机反馈「全局都显示很碍眼」。
-		// file-open 覆盖「换文件」，active-leaf-change 覆盖「切标签页 / 切到设置页」，
-		// 两条都挂才不会有残留。
 		this.plugin.registerEvent(
 			this.plugin.app.workspace.on('active-leaf-change', () => this.syncSwitcherVisibility()),
 		);
@@ -294,262 +241,14 @@ export class InkUI {
 		);
 	}
 
-	/** 同步切换器的高亮（编辑段 / 手写段互斥）。 */
-	private syncSwitcher(): void {
-		this.editSeg?.toggleClass('is-active', !this.active);
-		this.inkSeg?.toggleClass('is-active', this.active);
-	}
-
-	/* ==================== 悬浮切换器：显隐 ==================== */
-
-	/**
-	 * 当前视图是不是在 PDF 上。
-	 *
-	 * 只认活动文件的扩展名：PDF 阅读视图 / 新窗口打开都如实反映在 getActiveFile() 上，
-	 * 比去猜 leaf 的 view 类型稳（pdf.js 的视图类没有稳定的公开类型名）。
-	 */
-	private isPdfContext(): boolean {
-		try {
-			return this.plugin.app.workspace.getActiveFile()?.extension === 'pdf';
-		} catch {
-			return false;
-		}
-	}
-
-	/**
-	 * 同步悬浮胶囊（含三段）的显隐。设置里改开关、切换文件、切换标签页都会走到这里。
-	 *
-	 * 判定顺序：
-	 *   ① 用户在设置里关掉了 → 整颗隐藏；
-	 *   ② 当前不在 PDF 视图 → 整颗隐藏（「全局都显示很碍眼」的根治）；
-	 *   ③ 三段各自的开关 → 逐段隐藏；
-	 *   ④ 三段都被关掉 → 整颗隐藏（否则只剩一个空壳，比不显示更碍眼）。
-	 */
-	syncSwitcherVisibility(): void {
-		const sw = this.toggleBtn;
-		if (!sw) return;
-		const s = this.plugin.settings;
-
-		const showEdit = s.inkShowEditSeg !== false;
-		const showInk = s.inkShowInkSeg !== false;
-		const showSide = s.inkShowSideSeg !== false;
-		const anySeg = showEdit || showInk || showSide;
-
-		const hidden = s.inkSwitcherHidden === true || !this.isPdfContext() || !anySeg;
-		sw.toggleClass('is-hidden', hidden);
-
-		this.editSeg?.toggleClass('is-hidden', !showEdit);
-		this.inkSeg?.toggleClass('is-hidden', !showInk);
-		this.sideSeg?.toggleClass('is-hidden', !showSide);
-
-		// 指引只在按钮**真的出现**时给一次。原先挂在 mount 上，用户若正好停在
-		// 普通笔记里，提示会指向一颗看不见的按钮。
-		if (!hidden && !InkUI.mountHintShown) {
-			InkUI.mountHintShown = true;
-			new Notice(
-				`FleurPDF 手写批注已就绪 v${ this.plugin.manifest.version }：点击右下角的“手写”按钮开始批注`,
-			);
-		}
-	}
-
-	/** 供外部（设置页改开关后）刷新显隐。 */
-	refreshVisibility(): void {
-		this.syncSwitcherVisibility();
-		this.applySwitcherPos();
-	}
-
-	/* ==================== 悬浮切换器：拖动 / 收起 ==================== */
-
-	/**
-	 * 把胶囊放到设置里记住的位置。
-	 *
-	 * y 存的是**视口比例**而不是像素：换设备、转屏、改分辨率后像素值会落到屏幕外，
-	 * 比例不会。`translateY(-50%)` 让 top 百分比落在胶囊中心而不是顶边。
-	 */
-	private applySwitcherPos(): void {
-		const sw = this.toggleBtn;
-		if (!sw) return;
-		const side = this.plugin.settings.inkSwitcherSide ?? 'right';
-		const y = Math.min(1, Math.max(0, this.plugin.settings.inkSwitcherY ?? 0.78));
-		sw.setCssStyles({
-			left: side === 'left' ? '12px' : 'auto',
-			right: side === 'right' ? '12px' : 'auto',
-			top: `${Math.round(y * 100)}%`,
-			bottom: 'auto',
-			transform: 'translateY(-50%)',
-		});
-	}
-
-	/**
-	 * 拖动换位 + 长按收起。
-	 *
-	 * 三段按钮仍是点击语义，所以必须把「拖动」与「点击」分开：位移小于 6px 一律当点击
-	 * （交给按钮自己的 click），超过才进入拖动。拖动结束后再用一次捕获态 click 把紧随其后的
-	 * 误点吞掉 —— 否则松手会顺手触发按钮动作（例如误入手写模式）。
-	 */
-	private attachSwitcherDrag(sw: HTMLElement): void {
-		let dragging = false;
-		let moved = false;
-		let startX = 0;
-		let startY = 0;
-		let originLeft = 0;
-		let originTop = 0;
-		let longPress: number | null = null;
-
-		const clearLongPress = () => {
-			if (longPress !== null) {
-				window.clearTimeout(longPress);
-				longPress = null;
-			}
-		};
-
-		sw.addEventListener('pointerdown', (e) => {
-			if (e.pointerType === 'mouse' && e.button !== 0) return;
-			dragging = true;
-			moved = false;
-			startX = e.clientX;
-			startY = e.clientY;
-			const r = sw.getBoundingClientRect();
-			originLeft = r.left;
-			originTop = r.top;
-			// 立刻换算成「绝对定位 + 无 transform」的等价表述：拖动时位移才是线性的，
-			// 否则 translateY(-50%) 与 top 会互相打架，胶囊会跳。
-			sw.setCssStyles({
-				left: `${originLeft}px`,
-				right: 'auto',
-				top: `${originTop}px`,
-				bottom: 'auto',
-				transform: 'none',
-			});
-			// 捕获指针：手指滑出胶囊边界后 move 事件仍派发到这里。
-			// 没有它，触摸拖动只要偏出元素几像素就收不到 move（触摸的隐式捕获
-			// 只在浏览器不接管手势时存在，而真机手指面积大、极易滑出）。
-			try {
-				(sw as HTMLElement).setPointerCapture(e.pointerId);
-			} catch {
-				/* 某些 WebView 对已释放指针抛错，忽略 */
-			}
-			clearLongPress();
-			// 长按 650ms = 收起（短于它都当点击，避免误收）
-			longPress = window.setTimeout(() => {
-				longPress = null;
-				if (moved) return;
-				dragging = false;
-				this.setSwitcherCollapsed(true);
-			}, 650);
-		}, true);
-
-		sw.addEventListener('pointermove', (e) => {
-			if (!dragging) return;
-			// 触摸拖动期间阻止浏览器把这套手势再解释成滚动/缩放（双保险，
-			// 第一道是 CSS touch-action: none）
-			if (e.pointerType !== 'mouse') e.preventDefault();
-			const dx = e.clientX - startX;
-			const dy = e.clientY - startY;
-			if (!moved) {
-				if (Math.hypot(dx, dy) < 6) return;
-				moved = true;
-				clearLongPress();
-				sw.addClass('is-dragging');
-			}
-			sw.setCssStyles({ left: `${originLeft + dx}px`, top: `${originTop + dy}px` });
-		});
-
-		const finish = (e: PointerEvent) => {
-			if (!dragging) return;
-			dragging = false;
-			try {
-				(sw as HTMLElement).releasePointerCapture?.(e.pointerId);
-			} catch {
-				/* 忽略 */
-			}
-			clearLongPress();
-			if (!moved) {
-				// 只点没拖：把 pointerdown 里改过的定位还原回去
-				sw.removeClass('is-dragging');
-				this.applySwitcherPos();
-				return;
-			}
-			sw.removeClass('is-dragging');
-			// 吞掉紧随其后的一次 click（拖动松手不应触发按钮动作）
-			sw.addEventListener('click', (ev) => {
-				ev.stopPropagation();
-				ev.preventDefault();
-			}, { capture: true, once: true });
-
-			// 吸附到最近的边；垂直位置夹在可视区内，避免被安全区/顶栏切掉
-			const r = sw.getBoundingClientRect();
-			const side: 'left' | 'right' = r.left + r.width / 2 < window.innerWidth / 2 ? 'left' : 'right';
-			const half = r.height / 2;
-			const centerY = Math.min(window.innerHeight - half - 8, Math.max(half + 8, r.top + r.height / 2));
-			this.plugin.settings.inkSwitcherSide = side;
-			this.plugin.settings.inkSwitcherY = centerY / window.innerHeight;
-			void this.plugin.saveSettings().catch(() => undefined);
-			this.applySwitcherPos();
-		};
-		sw.addEventListener('pointerup', (e) => finish(e as PointerEvent));
-		sw.addEventListener('pointercancel', (e) => finish(e as PointerEvent));
-
-		// 收起态下点一下把手即恢复（那时没有按钮可点，click 落在容器自己身上）
-		sw.addEventListener('click', (e) => {
-			if (this.plugin.settings.inkSwitcherCollapsed !== true) return;
-			e.preventDefault();
-			e.stopPropagation();
-			this.setSwitcherCollapsed(false);
-		}, true);
-	}
-
-	/** 收起 / 展开悬浮胶囊，状态持久化。 */
-	private setSwitcherCollapsed(collapsed: boolean): void {
-		this.plugin.settings.inkSwitcherCollapsed = collapsed;
-		void this.plugin.saveSettings().catch(() => undefined);
-		this.toggleBtn?.toggleClass('is-collapsed', collapsed);
-		if (collapsed) {
-			new Notice('悬浮按钮已收起：点侧边的小把手即可恢复，也可用命令面板的「显示 / 隐藏手写批注悬浮按钮」');
-		}
-	}
-
-	/**
-	 * 供命令面板调用：显示 / 隐藏悬浮胶囊（用户彻底找不到入口时的兜底）。
-	 *
-	 * 状态是两层的（收起 / 隐藏），命令一次只推进一步，且优先级是
-	 * 「先恢复可见，再谈收起」—— 用户敲这条命令时想的一定是「让我看见它」。
-	 */
-	toggleSwitcher(): void {
-		const s = this.plugin.settings;
-
-		if (s.inkSwitcherHidden === true) {
-			s.inkSwitcherHidden = false;
-			s.inkSwitcherCollapsed = false;
-			void this.plugin.saveSettings().catch(() => undefined);
-			this.toggleBtn?.removeClass('is-collapsed');
-			this.syncSwitcherVisibility();
-			new Notice('已显示手写批注悬浮按钮');
-			return;
-		}
-		if (s.inkSwitcherCollapsed === true) {
-			this.setSwitcherCollapsed(false);
-			return;
-		}
-		// 手写模式中不留无按钮的死角：先退出手写，用户就不必自己找出口
-		if (this.active) {
-			new Notice('请先退出手写模式，再隐藏悬浮按钮');
-			return;
-		}
-		s.inkSwitcherHidden = true;
-		void this.plugin.saveSettings().catch(() => undefined);
-		this.syncSwitcherVisibility();
-		new Notice('已隐藏悬浮按钮：可用命令面板或设置里的「显示悬浮按钮」重新打开');
-	}
-
 	unmount(): void {
 		document.body.removeEventListener('click', this.onBodyClick, true);
 		document.removeEventListener('visibilitychange', this.onHiddenFlush);
 		window.removeEventListener('pagehide', this.onHiddenFlush);
 		// 卸载前尽力落盘（异步发起，不阻塞卸载流程）
 		if (this.active) void this.exitInk();
+		else this.overlay.detach();
 		this.cancelAutoSave();
-		this.hideLassoBox();
 		this.toggleBtn?.remove();
 		this.toggleBtn = null;
 		this.editSeg = null;
@@ -583,289 +282,162 @@ export class InkUI {
 			return;
 		}
 
-		// ⚠️ 顺序不可颠倒：必须**先进入编辑模式**，引擎才可能补齐 UIManager。
-		// 因为兜底路径「播种编辑器」依赖当前模式（模式为 0 时 pdf.js 造不出编辑器），
-		// 而笔色/粗细又必须在第一笔落墨**之前**下发。
-		// 0.4.0 起 enterInk 是异步的：NONE → INK 触发 pdf.js 的重路径（updater 要等所有页
-		// pagerendered），applyActivePen 必须等模式真落盘，否则 UIManager 拿不到。
-		const pen = this.pens[this.penIndex];
-		const res = pen.kind === 'marker' ? await this.engine.enterMarker() : await this.engine.enterInk();
-
-		// ⚠️ 这里**只有 res.error 才是真失败**（viewer 还没 setDocument，pdf.js 的门闩
-		// 未开，赋值当场抛 "The AnnotationEditor is not enabled."）。
-		//
-		// res.ok === false 只代表「没能在超时时间内观察到模式落盘」，**不代表进不去**：
-		// pdf.js 的 NONE → INK 是异步重路径 —— 先 toggleEditingMode，再等**所有已渲染页**
-		// pagerendered，最后 setTimeout(updater, 0) 才真正写值。移动端首屏较大的 PDF
-		// 完全可能超过 8s。0.4.3 及以前在这里 `if (!res.ok) { Notice(...); return; }`，
-		// 于是真机上「每次打开手写都提示不可用、要等一会才能用」，而更严重的是
-		// **整套 UI 都没挂上**：笔盒、手势盾、触摸路由、attachDrawSettle（自动落盘）、
-		// 固有笔迹播种全部缺席 —— 用户在提示出现后接着写，笔迹既不落盘也擦不掉，
-		// 于是「重开文件后手写内容又消失了」。这是本轮两个主诉的共同根因。
-		//
-		// UI 挂载与模式值无关（落墨最终由 pdf.js 自己的编辑层处理），所以照常继续，
-		// 只补一次延迟重试，避免真的卡在旧模式上。
-		if (res.error) {
-			new Notice(`手写模式不可用：${res.error}`);
-			return;
-		}
-
-		// 归零上一次进入留下的编辑器（pdf.js 退出编辑模式不会销毁它们）。
-		// 放在这里而不是 restoreInkFromStore 里：那个函数是延迟 300ms 才跑的，
-		// 而用户在 300ms 内落笔是理论上可能的 —— 那时清空会正好删掉他刚画的那一笔。
-		// 此刻 enterInk 刚起步，用户不可能已经在画，是唯一无竞态的清空时机。
-		try {
-			const cleared = this.engine.clearInkEditors();
-			if (cleared) console.log(`[FleurPDF Ink] 清理上一轮残留编辑器 ${cleared} 个`);
-		} catch {
-			/* 清不掉最多是重影，不影响后面的重建 */
-		}
-		if (!res.ok) {
-			console.warn(
-				'[FleurPDF Ink] 进入手写模式未在超时内确认，继续挂载 UI 并延迟重试：',
-				res.before,
-				'→',
-				res.after,
-			);
-			const wantMode = this.engine.constants?.AnnotationEditorType.INK ?? 15;
-			window.setTimeout(() => {
-				if (!this.active) return;
-				if (this.engine.getMode() === wantMode) return;
-				void this.engine.setModeAsync(wantMode, 4000);
-			}, 2500);
-		}
-
-		await this.applyActivePen();
+		// 覆盖层引擎挂上 —— 输入 / 渲染 / 橡皮 / 套索全归它管。
+		// 不再需要 pdf.js 的编辑模式与 UIManager：这两层正是旧架构一切顽疾的来源。
+		this.overlay.attach(handle.viewer);
+		this.overlay.setTool(this.currentTool());
+		this.overlay.onChange(() => {
+			// 每次数据变化（一笔提交 / 擦除 / 移动 / 撤销）都排一次空闲落盘
+			this.scheduleAutoSave();
+		});
 
 		this.active = true;
 		document.body.addClass('fleur-pdf-ink-active');
 		this.syncSwitcher();
 		this.buildPenBar();
-		this.attachGestureShield();
-		this.attachTouchRouter();
-		// 按当前笔恢复输入接管（上次退出时可能停在橡皮 / 套索上）
-		const activeKind = this.pens[this.penIndex].kind;
-		this.setPenInputMode(activeKind === 'eraser' ? 'eraser' : activeKind === 'lasso' ? 'lasso' : 'draw');
 
-		// 拿不到 UIManager 时「写」仍然正常，但笔参数、橡皮、撤销会静默失效。
-		// 这是用户最难自行诊断的失败形态（看起来像按钮坏了），必须明说。
-		if (!this.engine.getUIManager()) {
-			this.umMissing = true;
-			new Notice('手写已开启，但当前 PDF 视图的批注接口不可用：可书写，笔色 / 橡皮 / 撤销暂不可用');
-		} else {
-			this.umMissing = false;
-			// 恢复历史笔迹 —— 方案 C 的读端（见 restoreInkFromStore）。
-			//
-			// 这里刻意**不依赖**「注释层是否已渲染完」：0.4.4 之所以失败，正是因为
-			// 播种走的是 pdf.js 的固有注释转换链路，而那条链路要求注释元素先挂上 DOM，
-			// 时机不可控且只试一次。现在的数据来自插件自己的 JSON，与注释渲染无关。
-			// 300ms 只是给编辑层挂上 DOM 的宽限（deserialize 需要 layer.viewport 就绪）。
-			window.setTimeout(() => {
-				if (this.active) void this.restoreInkFromStore();
-			}, 300);
-		}
+		// 恢复历史笔迹（含 0.5.x 数据迁移与 0.4.x 固有注释接管），不等它完成也可以写
+		void this.loadInkFromStore();
 	}
 
 	/**
-	 * 恢复历史笔迹 —— 方案 C 的读端。
+	 * 恢复历史笔迹 —— 覆盖层架构的读端。
 	 *
 	 * 三段职责，顺序不能换：
-	 *   ① **接管**：把 PDF 里既有的固有 `/Ink` 注释（0.4.x 写回去的老数据）转成
-	 *      我们自己的数据。增量、可重入 —— pdf.js 只渲染视口附近的页，注释层是
-	 *      按需出现的，一次全量扫描必然漏，所以每次进入都补扫一遍。
-	 *   ② **重建**：从数据建出编辑器。重建出来的编辑器不带 `annotationElementId`，
-	 *      pdf.js 视其为「本次会话新画的」，`serialize()` 永远正常返回 —— 这是
-	 *      「不论关闭重开，历史笔迹都能擦」的根基。
-	 *   ③ **隐藏原件**：PDF 里那些被接管过的注释仍在（我们不改写用户文件），
-	 *      不藏起来就会与重建体叠成双影，而且它们擦不掉（固有编辑器 serialize() 恒 null）。
-	 *
-	 * 隐藏规则有两档，刻意不对称：
-	 *   · 以前接管过的（记录在 sidecar.claimedIds）**无条件继续隐藏** —— 哪怕对应
-	 *     的 entry 已经被用户擦掉了。那正是「擦掉」的含义：原件还在 PDF 里，不藏就复活。
-	 *   · 本轮新接管的只隐藏**确实重建成功**的那些 —— 万一数据坏了建不出来，
-	 *     把原件也藏掉就等于笔迹凭空消失，比看得见但擦不掉更糟。
+	 *   ① 读 sidecar：v2 直接用；v1（0.5.x 的编辑器快照）现场迁移成自有模型；
+	 *   ② 增量接管：把 PDF 里既有的固有 /Ink 注释（0.4.x 写回的老数据）转成
+	 *      自有数据。走 page.getAnnotations() 纯数据接口 —— 与注释层渲染时机
+	 *      完全无关，这是 0.4.x 六轮修复反复栽跟头的地方，如今彻底绕开。
+	 *   ③ 隐藏原件：被接管过的注释仍在 PDF 里（我们不写回、不删它），不藏
+	 *      就会与覆盖层叠成双影。页面重建后由引擎的 reconcile 自动补涂。
 	 */
-	private async restoreInkFromStore(): Promise<void> {
+	private async loadInkFromStore(): Promise<void> {
 		const file = this.engine.getFile();
 		if (!file) return;
 		// 换文件后基线必须作废：否则新文件的第一笔会拿旧文件的指纹比对，被误判成「没变化」
 		this.lastSavedJson = '';
 		this.lastFile = file;
-		this.lastEntries = null;
+		this.lastStrokes = null;
 
-		let sidecar: InkSidecar | null = null;
+		let strokes: InkStroke[] = [];
+		const claimed = new Set<string>();
+
 		try {
-			sidecar = await this.inkStore.load(file);
+			const loaded = await this.inkStore.load(file);
+			if (loaded?.kind === 'v2') {
+				strokes = loaded.strokes;
+				for (const id of loaded.claimedIds) claimed.add(id);
+			} else if (loaded?.kind === 'v1') {
+				// v1 迁移：按「页 + 页内序号」的归一化坐标 × 页框 = PDF 用户空间
+				for (const id of loaded.legacy.claimedIds ?? []) claimed.add(id);
+				for (const e of loaded.legacy.entries) {
+					if (e.sourceId) claimed.add(e.sourceId);
+				}
+				const boxCache = new Map<number, number[] | null>();
+				let migrated = 0;
+				for (const entry of loaded.legacy.entries) {
+					const page = entry.page + 1;
+					if (!boxCache.has(page)) boxCache.set(page, await this.engine.getPageViewBox(page));
+					const s = v1EntryToStroke(entry, boxCache.get(page) ?? null);
+					if (s) {
+						strokes.push(s);
+						migrated++;
+					}
+				}
+				console.log(`[FleurPDF Ink] 已迁移 0.5.x 笔迹 ${migrated}/${loaded.legacy.entries.length} 条`);
+			}
 		} catch (err) {
 			console.warn('[FleurPDF Ink] 读取手写数据失败（不影响新书写）:', err);
 		}
 
-		// 归零动作在 enterInk 里已经做完（见那里的注释），此处只负责读与建。
-
-		let entries: InkEntry[] = sidecar?.entries ? [...sidecar.entries] : [];
-		const previouslyClaimed = new Set<string>(sidecar?.claimedIds ?? []);
-
-		// ── ① 增量接管 ──
-		const skip = new Set<string>(previouslyClaimed);
-		for (const e of entries) if (e.sourceId) skip.add(e.sourceId);
-		let newlyClaimed: InkEntry[] = [];
+		// ── 增量接管 0.4.x 固有注释（每次进入都补扫，claimedIds 防复活）──
 		try {
-			newlyClaimed = await this.engine.claimInherentInk(skip);
+			const res = await this.engine.readInherentInk(claimed);
+			if (res.strokes.length) {
+				strokes = strokes.concat(res.strokes);
+				for (const id of res.ids) claimed.add(id);
+				console.log(`[FleurPDF Ink] 已接管 PDF 固有手写笔迹 ${res.strokes.length} 条`);
+			}
 		} catch (err) {
 			console.warn('[FleurPDF Ink] 接管固有笔迹失败（下一轮重试）:', err);
 		}
-		if (newlyClaimed.length) {
-			entries = entries.concat(newlyClaimed);
-			console.log(`[FleurPDF Ink] 新接管 PDF 固有手写笔迹 ${newlyClaimed.length} 条`);
-		}
 
-		// ── ② 重建 ──
-		let restored = new Set<string>();
-		if (entries.length) {
-			try {
-				restored = await this.engine.restoreStrokeEntries(entries);
-				if (restored.size || entries.length) {
-					console.log(`[FleurPDF Ink] 已恢复手写笔迹 ${entries.length} 条`);
-				}
-			} catch (err) {
-				console.warn('[FleurPDF Ink] 恢复手写笔迹失败（不影响新书写）:', err);
-			}
-		}
-
-		// ── ③ 隐藏原件 ──
-		const hide = new Set<string>(previouslyClaimed);
-		for (const e of newlyClaimed) {
-			if (e.sourceId && restored.has(e.sourceId)) hide.add(e.sourceId);
-		}
-		if (hide.size) {
-			try {
-				this.engine.hideInherentInk(hide);
-			} catch {
-				/* 隐藏失败最多是重影，不影响可擦性 */
-			}
-		}
-
-		// ── 落盘：条目 + 认领名单 ──
-		// 认领名单必须落盘且只增不减（见 ink-store.ts 的 claimedIds 注释）。
-		// 本轮新认领但没建成功的**不入册**，留给下一轮重试。
-		const claimedIds = Array.from(hide);
-		this.claimedIds = hide;
-		this.lastSavedJson = JSON.stringify(entries);
-		this.lastEntries = entries;
-		try {
-			await this.inkStore.save(file, entries, claimedIds);
-		} catch (err) {
-			console.warn('[FleurPDF Ink] 写入手写数据失败（不影响新书写）:', err);
-		}
+		this.claimedIds = claimed;
+		this.overlay.hideInherentInk(claimed);
+		this.overlay.loadStrokes(strokes);
+		this.lastSavedJson = JSON.stringify(strokes);
+		this.lastStrokes = strokes;
 	}
 
 	async exitInk(): Promise<void> {
-		// 退出即落盘。点「完成」的用户语义是「我写完了」，此时把批注留在内存里
-		// 等于让他在下次打开文件时发现全没了（真机 0.4.0 的主诉）。
-		// 没有未保存内容时 autoSave 直接跳过，不会白白重写文件。
+		// 退出即落盘：点「完成」的用户语义是「我写完了」。
 		this.cancelAutoSave();
+		this.overlay.flushActiveStroke();
 		await this.autoSave(false);
 
-		// 先提交：supportMultipleDrawings=true 时 pointerup 不会生成编辑器，
-		// 必须显式提交（或切模式，这里两者都做），否则最后一笔会丢。
-		await this.engine.commit();
-		await this.engine.exit();
-
-		this.clearLasso();
-		this.clearEraseRect();
+		this.overlay.detach();
 
 		this.active = false;
 		document.body.removeClass('fleur-pdf-ink-active');
 		this.syncSwitcher();
-		this.detachPenInput();
-		this.detachGestureShield();
-		this.detachTouchRouter();
 		this.penBar?.remove();
 		this.penBar = null;
 		// 退出时把当前笔参数落盘（下次进入原样恢复）
 		this.persist();
 	}
 
-	/** 笔盒上的保存钮：显式落盘。 */
+	/** 笔盒上的保存钮：显式落盘（不退出手写模式，可以接着写）。 */
 	private async save(): Promise<void> {
 		this.cancelAutoSave();
-		// 不再退出编辑态：落盘只写插件自己的 JSON、不改动 PDF 文件，
-		// 内存里的编辑器依然有效，用户可以接着写。
-		// （0.4.x 之所以写完就退出，是因为写回 PDF 会改写文件、旧文档句柄随即失效。）
 		await this.autoSave(false);
 	}
 
 	/* ============================ 自动落盘 ============================ */
 
 	/**
-	 * 把手写批注落盘。
+	 * 把手写批注落盘（插件自己的 JSON，不触碰 PDF ⇒ 视图永不因落盘而重载）。
 	 *
-	 * ⚠️ 0.5 起落盘目标是**插件自己的 JSON**，不再是 PDF 文件（见 ink-store.ts）。
-	 * 这是纯数据写入：不改写用户文件、不重新序列化 PDF、**不会让 Obsidian 重载视图** ——
-	 * 因此不会出现「写回后内存里尚未写回的笔迹全丢」。
-	 *
-	 * 三层保障（与 0.4.x 相同，只是落盘对象换了）：
-	 *   ① 每次落笔 / 擦除 / 套索改动后，空闲 AUTO_SAVE_IDLE_MS 静默落盘 ——
-	 *      兜住「不点保存直接杀掉 App」；
-	 *   ② 退出手写模式（点 ✓）时立刻落盘（exitInk）；
-	 *   ③ 切换文件 / 工作区布局变化时兜底落盘（flushBeforeLeave）。
-	 *
-	 * @param silent 静默模式：无内容可存时不提示，成功也不提示（失败仍会提示）。
-	 * @returns 是否真的写出了新内容。
+	 * 四层保障：
+	 *   ① 每次数据变化后空闲 AUTO_SAVE_IDLE_MS 静默落盘；
+	 *   ② 退出手写模式（点 ✓）时立刻落盘；
+	 *   ③ 切换文件 / 工作区布局变化时兜底落盘（flushBeforeLeave）；
+	 *   ④ 视图被销毁后用内存快照抢存（salvageSnapshot）。
 	 */
 	private async autoSave(silent: boolean): Promise<boolean> {
 		if (this.saving) {
-			// 落盘进行中：静默模式下直接跳过（下一次改动会重新排队），
-			// 显式点保存则要告诉用户「不是没保存，是正在保存」
 			if (!silent) new Notice('正在保存手写批注，请稍候');
 			return false;
 		}
 		this.saving = true;
 		try {
-			// 视图已被销毁（关闭文件 / 切标签页）→ 编辑器对象已经没了，
-			// 但最后一次内存快照还在手上，用它补一次盘再复位。
-			// 顺序很重要：salvageSnapshot 必须跑在 resetInkStateIfDead 之前 ——
-			// reset 会把 active / lastSavedJson 一起清掉。
-			if (!this.engine.isHandleAlive) {
+			if (!this.engine.isReady) {
 				const salvaged = await this.salvageSnapshot();
 				this.resetInkStateIfDead();
 				return salvaged;
 			}
-
-			// 提交当前绘制会话，否则最后一笔还没成为独立编辑器
-			this.engine.commit();
-			// commit() 是同步接口，但落进 AnnotationStorage 要等一拍（见 ink-engine 陷阱 4）
-			await new Promise((r) => window.setTimeout(r, 60));
 
 			const file = this.engine.getFile();
 			if (!file) {
 				if (!silent) new Notice('找不到对应的 PDF 文件，无法保存手写批注');
 				return false;
 			}
-			// 记下归属，供视图被销毁后的 salvageSnapshot 使用
 			this.lastFile = file;
 
-			const entries = this.engine.exportStrokeEntries();
-			const json = JSON.stringify(entries);
-			// 内容没变就不写。替代原先的 `engine.hasUnsaved`（那是 PDF 的 dirty 标志，
-			// 语义已不适用）。用内容指纹而不是条数：擦一笔再画一笔，条数可能完全相同。
+			// getStrokes 会先把进行中的手势提交掉 —— 最后一笔不丢
+			const strokes = this.overlay.getStrokes();
+			const json = JSON.stringify(strokes);
 			if (json === this.lastSavedJson) {
-				this.lastEntries = entries;
+				this.lastStrokes = strokes;
 				if (!silent) new Notice('当前没有需要保存的手写批注');
 				return false;
 			}
 
-			await this.inkStore.save(file, entries, Array.from(this.claimedIds));
+			await this.inkStore.save(file, strokes, Array.from(this.claimedIds));
 			this.lastSavedJson = json;
-			this.lastEntries = entries;
-			// 全程不触碰 PDF 文件 ⇒ Obsidian 不会重载视图 ⇒ 既不需要重连 handle，
-			// 也不会出现「重载后内存里未写回的笔迹全丢」（真机反复反馈的掉笔迹）。
-			if (!silent) new Notice(`已保存手写批注（${entries.length} 条）`);
+			this.lastStrokes = strokes;
+			if (!silent) new Notice(`已保存手写批注（${strokes.length} 条）`);
 			return true;
 		} catch (err) {
-			// 真失败（磁盘 / 权限）必须让用户知道 —— 静默失败会变成「批注又没了」。
-			// 但自动落盘的失败多半是「视图正在切换途中」这类一次性的，
-			// 每次都弹会变成噪音，所以每个会话只提示一次。
 			if (!silent || !this.saveErrorNotified) {
 				this.saveErrorNotified = true;
 				new Notice(`手写批注保存失败：${err instanceof Error ? err.message : String(err)}`);
@@ -879,38 +451,26 @@ export class InkUI {
 	/**
 	 * PDF 视图已被销毁时的状态复位。
 	 *
-	 * 关闭文件不会走 exitInk（用户没点「完成」），于是 active 一直留在 true、
-	 * engine 也还攥着旧 handle。复位后悬浮切换器回到「编辑」态、笔盒收起，
-	 * 后续的 file-open / layout-change 不会再拿幽灵 handle 去做无意义的落盘。
-	 *
-	 * ⚠️ 0.5 起**不再需要** 0.4.x 的 `reattachIfReloaded`（热重连）：
-	 * 那条路径是为「写回 PDF ⇒ 触发视图重载 ⇒ 旧 handle 变死」准备的。现在落盘
-	 * 只写插件自己的 JSON、完全不碰 PDF，视图不会被我们自己搞重载；而笔迹的真相源
-	 * 就在 JSON 里 —— 即便视图因外部原因（别的程序改了文件、同步回传）被重建，
-	 * 重新进入手写时 restoreInkFromStore() 会原样恢复，不存在「笔迹丢了」。
+	 * 关闭文件不会走 exitInk（用户没点「完成」），active 会一直留在 true。
+	 * 覆盖层架构下视图销毁的后果极轻：笔迹数据在我们手上（lastStrokes），
+	 * 重新进入手写时 loadInkFromStore() 原样恢复，不存在「笔迹丢了」。
 	 */
 	private resetInkStateIfDead(): void {
 		if (!this.active) return;
 		this.cancelAutoSave();
-		this.clearLasso();
-		this.clearEraseRect();
-		// 视图已换人：落盘基线一并作废，否则新视图的第一笔会拿旧基线比对
+		this.overlay.detach();
 		this.lastSavedJson = '';
 		this.active = false;
 		document.body.removeClass('fleur-pdf-ink-active');
 		this.syncSwitcher();
-		this.detachPenInput();
-		this.detachGestureShield();
-		this.detachTouchRouter();
 		this.penBar?.remove();
 		this.penBar = null;
 	}
 
 	/** 安排一次空闲落盘（每次改动后调用，重复调用只保留最后一次）。 */
 	private scheduleAutoSave(): void {
-		// 先同步刷新内存快照，再排防抖。
-		// 顺序不能反：快照的意义就是「视图还活着的时候把状态接住」，
-		// 放到定时器里就晚了（那时视图可能已经没了）。
+		// 先同步刷新内存快照，再排防抖。顺序不能反：快照的意义就是
+		// 「视图还活着的时候把状态接住」，放到定时器里就晚了。
 		this.captureSnapshot();
 		if (this.autoSaveTimer !== null) window.clearTimeout(this.autoSaveTimer);
 		this.autoSaveTimer = window.setTimeout(() => {
@@ -927,41 +487,35 @@ export class InkUI {
 	}
 
 	/**
-	 * 同步把「此刻编辑器里有什么」抄进内存（不落盘）。
-	 *
-	 * 刻意不加节流：调用点是「一笔画完 / 一次擦除完成」，不是 pointermove，
-	 * 一页几百笔时单次开销在毫秒级；而漏掉任何一次都可能正好是视图死前的最后一笔。
+	 * 同步把「此刻引擎里有什么」抄进内存（不落盘）。
+	 * 刻意不加节流：调用点是「一笔画完 / 一次擦除完成」，不是 pointermove。
 	 */
 	private captureSnapshot(): void {
 		try {
-			if (!this.engine.isHandleAlive) return;
+			if (!this.active || !this.engine.isReady) return;
 			const file = this.engine.getFile();
 			if (!file) return;
 			this.lastFile = file;
-			this.lastEntries = this.engine.exportStrokeEntries();
+			this.lastStrokes = this.overlay.getStrokes();
 		} catch {
 			/* 快照失败只是少一层保险，不打断书写 */
 		}
 	}
 
 	/**
-	 * 视图已销毁时的抢存。
-	 *
-	 * 到这一步 pdf.js 的编辑器已经没了，exportStrokeEntries() 只能拿到空数组，
-	 * 所以唯一的补救是把最后一次内存快照（captureSnapshot）写进 sidecar。
-	 * 这是「关闭文件」路径上防掉笔迹的最后一层，与 1500ms 空闲落盘互补：
+	 * 视图已销毁时的抢存：用最后一次内存快照（captureSnapshot）写进 sidecar。
 	 * 空闲落盘覆盖「写完停手再关」，抢存覆盖「写完立刻关」。
 	 */
 	private async salvageSnapshot(): Promise<boolean> {
 		const file = this.lastFile;
-		const entries = this.lastEntries;
-		if (!file || !entries) return false;
-		const json = JSON.stringify(entries);
+		const strokes = this.lastStrokes;
+		if (!file || !strokes) return false;
+		const json = JSON.stringify(strokes);
 		if (json === this.lastSavedJson) return false;
 		try {
-			await this.inkStore.save(file, entries, Array.from(this.claimedIds));
+			await this.inkStore.save(file, strokes, Array.from(this.claimedIds));
 			this.lastSavedJson = json;
-			console.log(`[FleurPDF Ink] 视图已销毁，已用内存快照补存 ${entries.length} 条笔迹`);
+			console.log(`[FleurPDF Ink] 视图已销毁，已用内存快照补存 ${strokes.length} 条笔迹`);
 			return true;
 		} catch (err) {
 			console.warn('[FleurPDF Ink] 快照补存失败:', err);
@@ -971,10 +525,7 @@ export class InkUI {
 
 	/**
 	 * 要离开当前 PDF 了（切文件 / 布局变化）→ 兜底落盘。
-	 *
-	 * 只在「手写模式开着」且「当前 PDF 确实换了」时才动手：
-	 * layout-change 在许多无关场合（开侧边栏、拖分屏）都会触发，
-	 * 不加这两道闸会在用户只是调个界面时反复重写文件。
+	 * 只在「手写模式开着」且「当前 PDF 确实换了」时才动手。
 	 */
 	private async flushBeforeLeave(nextPath: string | null): Promise<void> {
 		if (!this.active) return;
@@ -983,6 +534,82 @@ export class InkUI {
 		if (nextPath && nextPath === cur) return;
 		this.cancelAutoSave();
 		await this.autoSave(true);
+	}
+
+	/* ============================ 工具切换 ============================ */
+
+	/** 把当前选中的笔翻译成引擎工具。 */
+	private currentTool(): InkTool {
+		const pen = this.pens[this.penIndex];
+		if (pen.kind === 'eraser') {
+			return { mode: 'eraser', radius: Math.max(2, pen.thickness) };
+		}
+		if (pen.kind === 'lasso') {
+			return { mode: 'lasso' };
+		}
+		return {
+			mode: 'pen',
+			color: pen.color,
+			width: pen.thickness,
+			opacity: pen.opacity,
+			kind: pen.kind === 'marker' ? 'marker' : 'pen',
+		};
+	}
+
+	/** 当前笔（含擦除模式的选区映射）下发给引擎。 */
+	private applyTool(): void {
+		if (!this.active) return;
+		this.overlay.setTool(this.currentTool());
+	}
+
+	private async selectPen(i: number): Promise<void> {
+		// 记录「点的就是当前已选中的那支」——橡皮要靠它判断是否展开设置弹层
+		const wasSame = this.penIndex === i;
+		this.penIndex = i;
+		this.applyTool();
+		this.persist();
+		this.refreshPenBar();
+		// 再次点击橡皮图标 → 展开橡皮设置（擦除模式 + 大小）
+		if (this.pens[i].kind === 'eraser' && wasSame) this.openEraserPop();
+	}
+
+	/** 展开橡皮设置弹层（擦除模式 + 大小）。 */
+	private openEraserPop(): void {
+		const pop = this.penBar?.querySelector<HTMLElement>('.fleur-pdf-ink-eraser-pop');
+		if (!pop) return;
+		const willOpen = !pop.hasClass('is-open');
+		this.closePops(pop);
+		pop.toggleClass('is-open', willOpen);
+	}
+
+	private setColor(color: string): void {
+		this.pens[this.penIndex].color = color;
+		this.applyTool();
+		this.persist();
+		this.refreshPenBar();
+	}
+
+	/**
+	 * 切换擦除模式（仅橡皮生效；随切换写回设置）。
+	 * 「选区擦除」= 套索圈选 + 删除按钮（引擎的 lasso 工具）。
+	 */
+	private setEraseMode(mode: EraseMode): void {
+		this.eraserMode = mode;
+		this.applyTool();
+		this.persist();
+		this.penBar
+			?.findAll('.fleur-pdf-ink-eraser-pop .fleur-pdf-ink-mode')
+			.forEach((el) => {
+				const label = el.textContent ?? '';
+				el.toggleClass('is-active', label === ERASE_MODE_LABEL[mode]);
+			});
+	}
+
+	/** 重绘笔盒（选中态、颜色方块、粗细圆点都要跟着变）。 */
+	private refreshPenBar(): void {
+		const wasActive = this.active;
+		this.buildPenBar();
+		if (!wasActive) this.penBar?.remove();
 	}
 
 	/* ============================ 笔盒 ============================ */
@@ -1009,11 +636,9 @@ export class InkUI {
 		const colorBtn = bar.createDiv('fleur-pdf-ink-btn');
 		setIcon(colorBtn, 'palette');
 		colorBtn.setAttribute('aria-label', '颜色');
+		const curKind = this.pens[this.penIndex].kind;
 		colorBtn.createDiv('fleur-pdf-ink-swatch').setCssStyles({
-			background:
-				this.pens[this.penIndex].kind === 'eraser' || this.pens[this.penIndex].kind === 'lasso'
-					? 'transparent'
-					: this.pens[this.penIndex].color,
+			background: curKind === 'eraser' || curKind === 'lasso' ? 'transparent' : this.pens[this.penIndex].color,
 		});
 		const colorPop = this.buildColorPop();
 		bar.appendChild(colorPop);
@@ -1023,12 +648,9 @@ export class InkUI {
 			colorPop.toggleClass('is-open', !colorPop.hasClass('is-open'));
 		});
 
-		// ── 粗细（钢笔 / 荧光笔）──
-		// 橡皮不单独占「大小」图标：它的模式与大小一起并进橡皮自己的设置弹层，
-		// 笔盒少一个图标，也少一处「这个图标是干嘛的」的困惑（0.3.0 真机反馈）。
+		// ── 大小（钢笔 / 荧光笔）或橡皮设置 ──
 		const pen = this.pens[this.penIndex];
-		const isEraser = pen.kind === 'eraser';
-		if (!isEraser) {
+		if (pen.kind !== 'eraser') {
 			const sizeBtn = bar.createDiv('fleur-pdf-ink-btn');
 			setIcon(sizeBtn, 'circle-dot');
 			sizeBtn.setAttribute('aria-label', '粗细');
@@ -1040,8 +662,7 @@ export class InkUI {
 				sizePop.toggleClass('is-open', !sizePop.hasClass('is-open'));
 			});
 		} else {
-			// 橡皮设置弹层（像素 / 笔画 / 选区 + 大小）常驻笔盒，
-			// 由「再次点击橡皮图标」展开 —— 见 selectPen 末尾。
+			// 橡皮设置弹层（擦除模式 + 大小）常驻笔盒，由「再次点击橡皮图标」展开
 			bar.appendChild(this.buildEraserPop());
 		}
 
@@ -1053,7 +674,7 @@ export class InkUI {
 		undoBtn.setAttribute('aria-label', '撤销');
 		undoBtn.addEventListener('click', (e) => {
 			e.stopPropagation();
-			this.engine.undo();
+			if (!this.overlay.undo()) new Notice('没有可撤销的操作');
 		});
 
 		const redoBtn = bar.createDiv('fleur-pdf-ink-btn');
@@ -1061,17 +682,17 @@ export class InkUI {
 		redoBtn.setAttribute('aria-label', '重做');
 		redoBtn.addEventListener('click', (e) => {
 			e.stopPropagation();
-			this.engine.redo();
+			if (!this.overlay.redo()) new Notice('没有可重做的操作');
 		});
 
-		// ── 删除选中（仅套索激活时出现：删除的是套索圈中的选择集）──
-		if (this.pens[this.penIndex].kind === 'lasso') {
+		// ── 删除选中（仅套索激活时出现：删除的是选区里的笔迹）──
+		if (pen.kind === 'lasso') {
 			const delBtn = bar.createDiv('fleur-pdf-ink-btn');
 			setIcon(delBtn, 'trash-2');
 			delBtn.setAttribute('aria-label', '删除选中');
 			delBtn.addEventListener('click', (e) => {
 				e.stopPropagation();
-				this.deleteLassoSelection();
+				if (!this.overlay.deleteSelection()) new Notice('先用套索圈选要删除的笔迹');
 			});
 		}
 
@@ -1080,7 +701,7 @@ export class InkUI {
 		// ── 保存 / 完成 ──
 		const saveBtn = bar.createDiv('fleur-pdf-ink-btn is-primary');
 		setIcon(saveBtn, 'save');
-		saveBtn.setAttribute('aria-label', '写回 PDF');
+		saveBtn.setAttribute('aria-label', '保存批注');
 		saveBtn.addEventListener('click', (e) => {
 			e.stopPropagation();
 			void this.save();
@@ -1111,18 +732,16 @@ export class InkUI {
 			if (c === this.pens[this.penIndex].color) dot.addClass('is-active');
 			dot.addEventListener('click', (e) => {
 				e.stopPropagation();
-				void this.setColor(c);
+				this.setColor(c);
 			});
 		}
 		return pop;
 	}
 
 	/**
-	 * 大小滑块（钢笔 / 荧光笔 / 橡皮共用，0.3.0 起替代固定档位圆点）。
-	 *
-	 * 拖动过程只改内存值 + 实时下发参数，**不重建笔盒**（重建会让滑块在手指下消失）；
-	 * 松手（change）时才落盘。橡皮不吃引擎参数 —— 它的 thickness 就是命中半径，
-	 * 由 eraseAtPoint 实时读取，所以拖动即时生效。
+	 * 大小滑块（钢笔 / 荧光笔 / 橡皮共用）。
+	 * 拖动过程只改内存值 + 实时下发，不重建笔盒（重建会让滑块在手指下消失）；
+	 * 松手（change）时才落盘。
 	 */
 	private buildSizeSlider(): HTMLElement {
 		const pen = this.pens[this.penIndex];
@@ -1146,12 +765,9 @@ export class InkUI {
 
 		input.addEventListener('input', () => {
 			const v = Number(input.value);
-			const cur = this.pens[this.penIndex];
-			cur.thickness = v;
+			this.pens[this.penIndex].thickness = v;
 			value.setText(String(v));
-			// 0.4.0 起 applyPen 是异步的（要等 UIManager），拖动过程是连续的，
-			// 同一帧多次 in-flight 调用没问题：applyPenAsync 内部会按顺序串接 commit / unselectAll。
-			if (cur.kind === 'pen' || cur.kind === 'marker') void this.engine.applyPenAsync(cur);
+			this.applyTool();
 		});
 		input.addEventListener('change', () => this.persist());
 
@@ -1165,21 +781,18 @@ export class InkUI {
 		return pop;
 	}
 
-	/**
-	 * 橡皮设置弹层：擦除模式（像素 / 笔画 / 选区）+ 大小滑块。
-	 *
-	 * 0.3.0 起并入橡皮图标本身（再次点击已选中的橡皮图标即展开），
-	 * 不再单独占一个 `box-select` 图标 —— 真机反馈「多出来那个图标不知道是干什么的」。
-	 */
+	/** 橡皮设置弹层：擦除模式（笔画 / 选区）+ 大小滑块。 */
 	private buildEraserPop(): HTMLElement {
 		const pop = createDiv('fleur-pdf-ink-pop fleur-pdf-ink-eraser-pop');
-		const modes: EraseMode[] = ['pixel', 'stroke', 'select'];
-		const modeRow = pop.createDiv('fleur-pdf-ink-modes');
-		for (const m of modes) {
-			const item = modeRow.createDiv('fleur-pdf-ink-mode');
-			item.setText(ERASE_MODE_LABEL[m]);
-			if (m === this.eraserMode) item.addClass('is-active');
-			item.addEventListener('click', (e) => {
+		for (const m of ERASE_MODES) {
+			const item = pop.createDiv('fleur-pdf-ink-modes');
+			// 复用容器结构：每个模式一个选项行
+			const opt = item.createDiv('fleur-pdf-ink-mode');
+			opt.setText(ERASE_MODE_LABEL[m]);
+			if (m === this.eraserMode || (m === 'stroke' && this.eraserMode === 'pixel')) {
+				opt.addClass('is-active');
+			}
+			opt.addEventListener('click', (e) => {
 				e.stopPropagation();
 				this.setEraseMode(m);
 			});
@@ -1188,907 +801,221 @@ export class InkUI {
 		return pop;
 	}
 
-	/* ============================ 笔操作 ============================ */
+	/* ==================== 悬浮切换器：显隐 ==================== */
 
-	private async selectPen(i: number): Promise<void> {
-		// 记录「点的就是当前已选中的那支」——橡皮要靠它判断是否展开设置弹层
-		const wasSame = this.penIndex === i;
-		this.penIndex = i;
-		const pen = this.pens[i];
-		// 离开套索时清掉选择集 —— 带着选择去画/擦，行为会互相纠缠
-		if (pen.kind !== 'lasso') this.clearLasso();
-		await this.applyActivePen();
-		if (pen.kind === 'eraser') {
-			this.setPenInputMode('eraser');
-		} else if (pen.kind === 'lasso') {
-			// 套索不改 annotationEditorMode（与橡皮同理：输入层接管）。
-			// 但若当前不在任何编辑模式（首笔就是套索），先进墨迹模式让编辑器存在。
-			if (!this.engine.getMode()) await this.engine.enterInk();
-			this.setPenInputMode('lasso');
-		} else {
-			// 钢笔与荧光笔同走墨迹通道（0.2.0 起）；切换时会按笔重下发参数
-			await this.engine.enterInk();
-			this.setPenInputMode('draw');
-		}
-		this.persist();
-		this.refreshPenBar();
-		// 再次点击橡皮图标 → 展开橡皮设置（擦除模式 + 大小）。
-		// 让「擦除模式」并入橡皮图标，而不是另占一个图标。
-		if (pen.kind === 'eraser' && wasSame) this.openEraserPop();
-	}
-
-	/** 展开橡皮设置弹层（像素 / 笔画 / 选区 + 大小）。 */
-	private openEraserPop(): void {
-		const pop = this.penBar?.querySelector<HTMLElement>('.fleur-pdf-ink-eraser-pop');
-		if (!pop) return;
-		const willOpen = !pop.hasClass('is-open');
-		this.closePops(pop);
-		pop.toggleClass('is-open', willOpen);
-	}
-
-	private async setColor(color: string): Promise<void> {
-		this.pens[this.penIndex].color = color;
-		await this.applyActivePen();
-		this.persist();
-		this.refreshPenBar();
+	/** 同步切换器的高亮（编辑段 / 手写段互斥）。 */
+	private syncSwitcher(): void {
+		this.editSeg?.toggleClass('is-active', !this.active);
+		this.inkSeg?.toggleClass('is-active', this.active);
 	}
 
 	/**
-	 * 切换擦除模式（仅橡皮生效；随切换写回设置）。
-	 *
-	 * 注意：这里**不重建笔盒**。模式选项就挂在橡皮设置弹层里，
-	 * 重建会把用户刚展开的面板一起销毁。只翻转面板内的选中态即可。
+	 * 当前视图是不是在 PDF 上。
+	 * 只认活动文件的扩展名，比去猜 leaf 的 view 类型稳。
 	 */
-	private setEraseMode(mode: EraseMode): void {
-		this.eraserMode = mode;
-		this.clearEraseRect();
-		this.persist();
-		const modes: EraseMode[] = ['pixel', 'stroke', 'select'];
-		this.penBar
-			?.findAll('.fleur-pdf-ink-eraser-pop .fleur-pdf-ink-mode')
-			.forEach((el, idx) => el.toggleClass('is-active', modes[idx] === mode));
-	}
-
-	private async applyActivePen(): Promise<void> {
-		const pen = this.pens[this.penIndex];
-		// 橡皮 / 套索没有「笔参数」可下发（橡皮是输入层接管，套索不落墨）
-		if (pen.kind === 'eraser' || pen.kind === 'lasso') return;
-		// 0.4.0 起走异步版：UIManager 可能在 setMode 的异步 updater 跑完前还拿不到，
-		// 同步版本会立即失败静默返回；异步版会轮询等到 um 可用再下发参数。
-		await this.engine.applyPenAsync(pen);
-	}
-
-	/** 重绘笔盒（选中态、颜色方块、粗细圆点都要跟着变）。 */
-	private refreshPenBar(): void {
-		const wasActive = this.active;
-		this.buildPenBar();
-		if (!wasActive) this.penBar?.remove();
-	}
-
-	/* ============================ 输入接管 ============================ */
-
-	private eraserDetach: (() => void) | null = null;
-	private lassoDetach: (() => void) | null = null;
-
-	/**
-	 * 切换输入行为。
-	 *   draw    —— 交给 pdf.js（它已经接好了 pointer 监听）
-	 *   eraser  —— 由我们接管：拦截 pointer 事件，做笔画级擦除
-	 *   lasso   —— 由我们接管：圈选 / 移动 / 删除已写的笔画
-	 */
-	private setPenInputMode(mode: 'draw' | 'eraser' | 'lasso'): void {
-		this.eraserDetach?.();
-		this.eraserDetach = null;
-		this.lassoDetach?.();
-		this.lassoDetach = null;
-		this.detachDrawSettle();
-		if (mode === 'eraser') this.attachEraser();
-		else if (mode === 'lasso') this.attachLasso();
-		else this.attachDrawSettle();
-	}
-
-	/* ---------------- 落笔收尾：让笔迹保持「未选中」 ----------------
-	 * pdf.js 在 INK 模式下每画一笔都会把新编辑器留在 #selectedEditors 里
-	 * （`unselectAll()` 在 mode !== NONE 时不清选择集，见 ink-engine.releaseSelection）。
-	 * 不处理的话每一笔都带选中描边 —— 真机表现就是「一片选区框把几笔串起来」，
-	 * 而且后续任何一次改参数都有可能顺着选择集改到历史笔迹。
-	 * 用户明确要求手写时不得出现选区框，所以每次落笔后立刻把它释放掉。
-	 */
-	private drawSettleDetach: (() => void) | null = null;
-
-	private attachDrawSettle(): void {
-		if (this.drawSettleDetach) return;
-		const onUp = (e: PointerEvent): void => {
-			if (!this.active || !this.isInPdfArea(e.target)) return;
-			// 延到下一宏任务：等 pdf.js 完成本次绘制收尾（编辑器此刻才真正诞生）
-			window.setTimeout(() => {
-				if (!this.active) return;
-				this.engine.releaseSelection();
-				// 落笔即排一次空闲落盘（见 autoSave 的三层保障）
-				this.scheduleAutoSave();
-			}, 0);
-		};
-		window.addEventListener('pointerup', onUp, { capture: true });
-		window.addEventListener('pointercancel', onUp, { capture: true });
-		this.drawSettleDetach = () => {
-			window.removeEventListener('pointerup', onUp, { capture: true });
-			window.removeEventListener('pointercancel', onUp, { capture: true });
-		};
-	}
-
-	private detachDrawSettle(): void {
-		this.drawSettleDetach?.();
-		this.drawSettleDetach = null;
-	}
-
-	private attachEraser(): void {
-		const host = this.scrollHost ?? document.body;
-
-		const onDown = (e: PointerEvent) => {
-			// 双指手势优先给滚动逻辑（它在捕获阶段、注册更早，正常会先于这里被处理）
-			if (e.isPrimary === false) return;
-			if (this.eraserMode === 'select') {
-				// 选区擦除：起手记起点，拖出虚线矩形
-				this.eraseRectStart = { x: e.clientX, y: e.clientY };
-				this.ensureEraseRect();
-				this.updateEraseRect(e.clientX, e.clientY);
-			} else {
-				this.eraserDown = true;
-				this.lastErasePt = null;
-				void this.eraseAt(e.clientX, e.clientY);
-			}
-			e.preventDefault();
-			e.stopPropagation();
-		};
-		const onMove = (e: PointerEvent) => {
-			if (this.eraserMode === 'select') {
-				if (!this.eraseRectEl) return;
-				e.preventDefault();
-				e.stopPropagation();
-				this.updateEraseRect(e.clientX, e.clientY);
-				return;
-			}
-			if (!this.eraserDown) return;
-			e.preventDefault();
-			e.stopPropagation();
-			void this.eraseAt(e.clientX, e.clientY);
-		};
-		const onUp = (e: PointerEvent) => {
-			if (this.eraserMode === 'select') {
-				if (!this.eraseRectEl) return;
-				const start = this.eraseRectStart;
-				const end = { x: e.clientX, y: e.clientY };
-				this.clearEraseRect();
-				void this.finishEraseRect(start, end);
-				return;
-			}
-			this.eraserDown = false;
-			this.lastErasePt = null;
-			// 一次擦除手势结束 → 排一次空闲落盘
-			this.scheduleAutoSave();
-		};
-
-		host.addEventListener('pointerdown', onDown, { capture: true });
-		host.addEventListener('pointermove', onMove, { capture: true });
-		host.addEventListener('pointerup', onUp, { capture: true });
-		host.addEventListener('pointercancel', onUp, { capture: true });
-
-		this.eraserDetach = () => {
-			host.removeEventListener('pointerdown', onDown, { capture: true });
-			host.removeEventListener('pointermove', onMove, { capture: true });
-			host.removeEventListener('pointerup', onUp, { capture: true });
-			host.removeEventListener('pointercancel', onUp, { capture: true });
-		};
-	}
-
-	/* ---------------- 橡皮擦除调度（像素 / 笔画） ----------------
-	 * 灵敏度的三个来源（0.1.0 真机实测「不太灵敏」后继续修正）：
-	 *  1. 快速拖动时 pointermove 事件之间有间距 —— 沿「上一点 → 当前点」
-	 *     线段按步长插值补点；
-	 *  2. 每次命中都涉及 serialize/deserialize 重建，异步 —— 忙队列进行中
-	 *     只记最新坐标会漏掉中间点（快速画 Z 字时中段漏擦）。0.2.0 改为
-	 *     待办点队列：进行中把所有经过的点按序攒下，结束后逐点补擦；
-	 *  3. 一次命中只擦一笔 —— 现在一次调用擦掉半径内**全部**笔画
-	 *     （见 ink-erase.eraseAtPoint），拖过多笔时不再需要反复经过。
-	 */
-	private eraserDown = false;
-	private eraserBusy = false;
-	private pendingErasePts: Array<{ x: number; y: number }> = [];
-	private lastErasePt: { x: number; y: number } | null = null;
-
-	private async eraseAt(clientX: number, clientY: number): Promise<void> {
-		if (this.eraserBusy) {
-			this.pendingErasePts.push({ x: clientX, y: clientY });
-			return;
-		}
-		this.eraserBusy = true;
+	private isPdfContext(): boolean {
 		try {
-			const last = this.lastErasePt ?? { x: clientX, y: clientY };
-			const dist = Math.hypot(clientX - last.x, clientY - last.y);
-			const step = Math.max(4, (this.pens[this.penIndex].thickness || 8) * 0.5);
-			const n = Math.max(1, Math.ceil(dist / step));
-			for (let i = 1; i <= n; i++) {
-				const px = last.x + ((clientX - last.x) * i) / n;
-				const py = last.y + ((clientY - last.y) * i) / n;
-				await this.eraseSingle(px, py);
-				// 用户已松手就不再沿旧轨迹补擦
-				if (!this.eraserDown) return;
-			}
-			this.lastErasePt = { x: clientX, y: clientY };
-		} finally {
-			this.eraserBusy = false;
-			// 按序补擦攒下的待办点（不再只取最后一个）
-			const queue = this.pendingErasePts;
-			this.pendingErasePts = [];
-			if (queue.length && this.eraserDown) {
-				void (async () => {
-					for (const p of queue) {
-						if (!this.eraserDown) break;
-						await this.eraseAt(p.x, p.y);
-					}
-				})();
-			}
-		}
-	}
-
-	/** 在单个视口坐标点按当前模式擦一次。 */
-	private async eraseSingle(clientX: number, clientY: number): Promise<void> {
-		const pageEl = (document.elementFromPoint(clientX, clientY) as HTMLElement | null)?.closest<HTMLElement>('.page');
-		const pageNumber = Number(pageEl?.dataset.pageNumber ?? '1');
-		if (!Number.isFinite(pageNumber) || pageNumber < 1) return;
-
-		const point = toPdfPoint(this.engine, clientX, clientY, pageNumber);
-		if (!point) return;
-
-		await eraseAtPoint(this.engine, point, {
-			radius: this.pens[this.penIndex].thickness,
-			mode: this.eraserMode === 'pixel' ? 'pixel' : 'stroke',
-		});
-	}
-
-	/* ---------------- 选区擦除（矩形拖选） ---------------- */
-
-	private eraseRectEl: HTMLElement | null = null;
-	private eraseRectStart: { x: number; y: number } = { x: 0, y: 0 };
-
-	private ensureEraseRect(): void {
-		if (this.eraseRectEl?.isConnected) return;
-		const el = document.body.createDiv('fleur-pdf-erase-rect');
-		this.eraseRectEl = el;
-	}
-
-	private updateEraseRect(x: number, y: number): void {
-		const el = this.eraseRectEl;
-		if (!el) return;
-		const s = this.eraseRectStart;
-		const minX = Math.min(s.x, x);
-		const minY = Math.min(s.y, y);
-		el.setCssStyles({
-			left: `${minX}px`,
-			top: `${minY}px`,
-			width: `${Math.abs(x - s.x)}px`,
-			height: `${Math.abs(y - s.y)}px`,
-			display: 'block',
-		});
-	}
-
-	private clearEraseRect(): void {
-		this.eraseRectEl?.remove();
-		this.eraseRectEl = null;
-	}
-
-	/** 选区擦除收尾：矩形换算到起始页的 PDF 坐标，删除相交笔画。 */
-	private async finishEraseRect(
-		start: { x: number; y: number },
-		end: { x: number; y: number },
-	): Promise<void> {
-		// 拖动距离过小视为误触
-		if (Math.hypot(end.x - start.x, end.y - start.y) < 10) return;
-
-		// 以起点所在页为准（v1 约束：选区不跨页）
-		const pageEl = (document.elementFromPoint(start.x, start.y) as HTMLElement | null)?.closest<HTMLElement>('.page');
-		const pageNumber = Number(pageEl?.dataset.pageNumber ?? '1');
-		if (!Number.isFinite(pageNumber) || pageNumber < 1) return;
-
-		const p1 = toPdfPoint(this.engine, start.x, start.y, pageNumber);
-		const p2 = toPdfPoint(this.engine, end.x, end.y, pageNumber);
-		if (!p1 || !p2 || p1.pageIndex !== p2.pageIndex) return;
-
-		const r = await eraseInRect(this.engine, p1.pageIndex, {
-			minX: Math.min(p1.x, p2.x),
-			minY: Math.min(p1.y, p2.y),
-			maxX: Math.max(p1.x, p2.x),
-			maxY: Math.max(p1.y, p2.y),
-		});
-		if (r.changed) {
-			this.engine.commit();
-			this.scheduleAutoSave();
-			new Notice(`已擦除 ${r.removedStrokes} 笔`);
-		}
-	}
-
-	/* ============================ 套索 ============================ */
-
-	/**
-	 * 套索状态机（参考 GoodNotes）：
-	 *   · 在空白处拖一圈 → 圈中的墨迹注释整组入选（pdf.js 原生多选蓝框）；
-	 *   · 在选择集包围盒内起手拖动 → 群组移动（拖动中 CSS transform 跟手，松手契约重建）；
-	 *   · 在选择外轻点 → 取消选择。
-	 * 与橡皮同理：捕获阶段接管 pointer，pdf.js 完全看不到这些事件。
-	 */
-	private lassoDown = false;
-	private lassoGesture: 'idle' | 'select' | 'move' = 'idle';
-	private lassoStart: ScreenPoint = { x: 0, y: 0 };
-	private lassoPts: ScreenPoint[] = [];
-	/** 当前选择集（编辑器实例）与其所在页码。 */
-	private lassoSelection: any[] = [];
-	private lassoPageNumber = 0;
-	/** 移动中的实时位移（屏幕 px），松手时换算成 PDF 坐标重建。 */
-	private lassoOverlay: SVGSVGElement | null = null;
-	private lassoPathEl: SVGPathElement | null = null;
-	/**
-	 * 圈选完成后**保留**的选区虚线边界（GoodNotes 语义）。
-	 *
-	 * 为什么要自绘而不是用 pdf.js 原生选中态：0.3.0 为满足「手写时不得出现选区框」
-	 * （真机反复要求）给编辑层加了全局 CSS
-	 * `.annotationEditorLayer .inkEditor { border/outline: none !important }`，
-	 * 连带把套索的选中视觉也一并抹平了 —— 0.4.0 真机反馈「套索圈住了，
-	 * 但看不到圈的是哪一块」正是这个根因。
-	 * 给原生选中态开例外会让每一笔各自描边，与 GoodNotes「整组一个框」不符，
-	 * 所以自绘一个包住整个选择集的虚线框。
-	 */
-	private lassoBoxEl: HTMLElement | null = null;
-	/** 滚动 / 缩放时重算边界框的监听卸载器。 */
-	private lassoBoxDetach: (() => void) | null = null;
-
-	private attachLasso(): void {
-		const host = this.scrollHost ?? document.body;
-
-		const onDown = (e: PointerEvent) => {
-			if (e.isPrimary === false) return;
-			this.lassoDown = true;
-			this.lassoGesture = 'idle';
-			this.lassoStart = { x: e.clientX, y: e.clientY };
-			this.lassoPts = [this.lassoStart];
-			e.preventDefault();
-			e.stopPropagation();
-		};
-
-		const onMove = (e: PointerEvent) => {
-			if (!this.lassoDown) return;
-			e.preventDefault();
-			e.stopPropagation();
-			const pt = { x: e.clientX, y: e.clientY };
-
-			// 首次移动时决定手势：选择集内起手 → 移动；否则 → 圈选
-			if (this.lassoGesture === 'idle') {
-				const box = this.lassoSelection.length ? screenBBoxOfEditors(this.lassoSelection) : null;
-				const inside =
-					!!box &&
-					this.lassoStart.x >= box.minX - 4 &&
-					this.lassoStart.x <= box.maxX + 4 &&
-					this.lassoStart.y >= box.minY - 4 &&
-					this.lassoStart.y <= box.maxY + 4;
-				this.lassoGesture = inside ? 'move' : 'select';
-				if (this.lassoGesture === 'select') this.clearLassoSelectionOnly();
-			}
-
-			if (this.lassoGesture === 'move') {
-				const dx = pt.x - this.lassoStart.x;
-				const dy = pt.y - this.lassoStart.y;
-				for (const editor of this.lassoSelection) {
-					const div: HTMLElement | null = editor?.div ?? null;
-					if (div?.isConnected) div.style.transform = `translate(${dx}px, ${dy}px)`;
-				}
-				// 虚线边界与笔迹用同一个 transform 跟手，拖动过程中不会脱节
-				if (this.lassoBoxEl) this.lassoBoxEl.style.transform = `translate(${dx}px, ${dy}px)`;
-			} else if (this.lassoGesture === 'select') {
-				const last = this.lassoPts[this.lassoPts.length - 1];
-				if (Math.hypot(pt.x - last.x, pt.y - last.y) >= 3) this.lassoPts.push(pt);
-				this.drawLassoPath();
-			}
-		};
-
-		const onUp = (e: PointerEvent) => {
-			if (!this.lassoDown) return;
-			this.lassoDown = false;
-			const pt = { x: e.clientX, y: e.clientY };
-			const gesture = this.lassoGesture;
-			this.lassoGesture = 'idle';
-
-			if (gesture === 'move') {
-				this.finishLassoMove(pt);
-			} else if (gesture === 'select') {
-				this.finishLassoSelect(pt);
-			} else {
-				// 原地轻点：在选择外 → 取消选择
-				this.clearLassoSelectionOnly();
-				this.clearLassoPath();
-			}
-		};
-
-		host.addEventListener('pointerdown', onDown, { capture: true });
-		host.addEventListener('pointermove', onMove, { capture: true });
-		host.addEventListener('pointerup', onUp, { capture: true });
-		host.addEventListener('pointercancel', onUp, { capture: true });
-
-		this.lassoDetach = () => {
-			host.removeEventListener('pointerdown', onDown, { capture: true });
-			host.removeEventListener('pointermove', onMove, { capture: true });
-			host.removeEventListener('pointerup', onUp, { capture: true });
-			host.removeEventListener('pointercancel', onUp, { capture: true });
-		};
-	}
-
-	/** 圈选收尾：闭合多边形 → 命中测试 → 整组入选。 */
-	private finishLassoSelect(endPt: ScreenPoint): void {
-		const pts = [...this.lassoPts, endPt];
-		this.clearLassoPath();
-
-		// 轻点（拖动距离过小）：在选择外点一下 = 取消选择
-		const minX = Math.min(...pts.map((p) => p.x));
-		const maxX = Math.max(...pts.map((p) => p.x));
-		const minY = Math.min(...pts.map((p) => p.y));
-		const maxY = Math.max(...pts.map((p) => p.y));
-		if (Math.max(maxX - minX, maxY - minY) < 12) {
-			this.clearLassoSelectionOnly();
-			return;
-		}
-
-		// 圈选起点落在哪一页，就只在那一页找（v1 约束：跨页套索不做）
-		const pageEl = (document.elementFromPoint(pts[0].x, pts[0].y) as HTMLElement | null)?.closest<HTMLElement>(
-			'.page',
-		);
-		const pageNumber = Number(pageEl?.dataset.pageNumber ?? '1');
-		if (!Number.isFinite(pageNumber) || pageNumber < 1) return;
-
-		const poly = lassoPolyToPdf(this.engine, pts, pageNumber);
-		if (!poly) return;
-
-		const hits = lassoHitEditors(this.engine, pageNumber - 1, poly);
-		if (!hits.length) {
-			this.clearLassoSelectionOnly();
-			new Notice('圈内没有笔迹（本页的笔迹须已在手写模式下加载）');
-			return;
-		}
-		const r = this.engine.selectMany(hits);
-		this.lassoSelection = hits;
-		this.lassoPageNumber = pageNumber;
-		if (!r.ok) new Notice(`圈选完成，但部分笔画未能入选（${r.failed} 个）`);
-		// 圈中即画出「这块被选中了」的虚线边界（GoodNotes 同款语义）
-		this.showLassoBox();
-	}
-
-	/** 移动收尾：撤掉 transform，按最终位移做契约重建（删旧建新）。 */
-	private finishLassoMove(endPt: ScreenPoint): void {
-		const dxPx = endPt.x - this.lassoStart.x;
-		const dyPx = endPt.y - this.lassoStart.y;
-		const selection = this.lassoSelection;
-		this.clearLassoPath();
-
-		// 位移太小当作误触：还原 transform 即可。
-		// ⚠️ 这里必须把 lassoSelection 放回去 —— 选择集本身没变，只是没拖动，
-		// 清空会让虚线边界就此消失（用户得重新圈一次）。
-		const scale = this.engine.getScaleFactor() || 1;
-		if (Math.hypot(dxPx, dyPx) < 4) {
-			for (const editor of selection) {
-				const div: HTMLElement | null = editor?.div ?? null;
-				if (div) div.style.transform = '';
-			}
-			if (this.lassoBoxEl) this.lassoBoxEl.style.transform = '';
-			this.lassoSelection = selection;
-			return;
-		}
-
-		this.lassoSelection = [];
-
-		const dx = dxPx / scale;
-		const dy = -dyPx / scale; // PDF y 轴向上
-
-		void (async () => {
-			const rebuiltEditors: any[] = [];
-			for (const editor of selection) {
-				const div: HTMLElement | null = editor?.div ?? null;
-				if (div) div.style.transform = '';
-				const r = await moveEditorBy(this.engine, editor, dx, dy);
-				if (r.ok && r.rebuilt) rebuiltEditors.push(r.rebuilt);
-				else if (r.error) console.warn('[FleurPDF Ink] 套索移动失败:', r.error);
-			}
-			this.engine.unselectAll();
-			if (rebuiltEditors.length) {
-				// 重建后的编辑器保持入选，方便连续拖动
-				this.engine.selectMany(rebuiltEditors);
-				this.lassoSelection = rebuiltEditors;
-				this.lassoPageNumber = Number(rebuiltEditors[0]?.pageIndex ?? 0) + 1;
-				// 重建换了新的 DOM 节点，边界框必须按新位置重算
-				if (this.lassoBoxEl) this.lassoBoxEl.style.transform = '';
-				this.showLassoBox();
-			} else {
-				this.hideLassoBox();
-			}
-			this.engine.commit();
-			this.scheduleAutoSave();
-		})();
-	}
-
-	/** 删除当前选择集（笔盒上的垃圾桶）。 */
-	private deleteLassoSelection(): void {
-		if (!this.lassoSelection.length) {
-			new Notice('先用套索圈选要删除的笔画');
-			return;
-		}
-		const n = this.lassoSelection.length;
-		const r = this.engine.deleteSelected();
-		if (r.ok) {
-			new Notice(`已删除 ${n} 条手写批注`);
-			this.clearLassoSelectionOnly();
-			this.engine.commit();
-			this.scheduleAutoSave();
-			this.refreshPenBar();
-		} else {
-			new Notice(`删除失败：${r.error ?? '未知原因'}`);
-		}
-	}
-
-	private clearLassoSelectionOnly(): void {
-		this.lassoSelection = [];
-		this.hideLassoBox();
-		try {
-			this.engine.unselectAll();
+			return this.plugin.app.workspace.getActiveFile()?.extension === 'pdf';
 		} catch {
-			/* 忽略 */
+			return false;
 		}
 	}
 
-	private clearLasso(): void {
-		this.lassoDown = false;
-		this.lassoGesture = 'idle';
-		this.lassoSelection = [];
-		this.lassoPageNumber = 0;
-		this.clearLassoPath();
-		this.hideLassoBox();
+	/**
+	 * 同步悬浮胶囊（含三段）的显隐。设置里改开关、切换文件、切换标签页都会走到这里。
+	 */
+	syncSwitcherVisibility(): void {
+		const sw = this.toggleBtn;
+		if (!sw) return;
+		const s = this.plugin.settings;
+
+		const showEdit = s.inkShowEditSeg !== false;
+		const showInk = s.inkShowInkSeg !== false;
+		const showSide = s.inkShowSideSeg !== false;
+		const anySeg = showEdit || showInk || showSide;
+
+		const hidden = s.inkSwitcherHidden === true || !this.isPdfContext() || !anySeg;
+		sw.toggleClass('is-hidden', hidden);
+
+		this.editSeg?.toggleClass('is-hidden', !showEdit);
+		this.inkSeg?.toggleClass('is-hidden', !showInk);
+		this.sideSeg?.toggleClass('is-hidden', !showSide);
+
+		// 指引只在按钮真的出现时给一次
+		if (!hidden && !InkUI.mountHintShown) {
+			InkUI.mountHintShown = true;
+			new Notice(
+				`FleurPDF 手写批注已就绪 v${this.plugin.manifest.version}：点击右下角的“手写”按钮开始批注`,
+			);
+		}
 	}
 
-	/* ---- 圈选完成后的选区虚线边界（GoodNotes 式常驻边框） ---- */
-
-	/** 按当前选择集的屏幕位置画出 / 更新虚线边界；选择集为空则收起。 */
-	private showLassoBox(): void {
-		const box = screenBBoxOfEditors(this.lassoSelection);
-		if (!box) {
-			this.hideLassoBox();
-			return;
-		}
-		if (!this.lassoBoxEl?.isConnected) {
-			this.hideLassoBox();
-			this.lassoBoxEl = document.body.createDiv('fleur-pdf-lasso-box');
-			this.attachLassoBoxTracking();
-		}
-		// 走到这里说明不是拖动中（拖动只改 transform），先把上一轮的位移清掉
-		this.lassoBoxEl.style.transform = '';
-		this.syncLassoBoxRect(box);
+	/** 供外部（设置页改开关后）刷新显隐。 */
+	refreshVisibility(): void {
+		this.syncSwitcherVisibility();
+		this.applySwitcherPos();
 	}
 
-	/** 把边界框摆到给定屏幕包围盒上（外扩 6px 呼吸边距）。 */
-	private syncLassoBoxRect(box: { minX: number; minY: number; maxX: number; maxY: number }): void {
-		const el = this.lassoBoxEl;
-		if (!el) return;
-		const pad = 6;
-		el.setCssStyles({
-			left: `${box.minX - pad}px`,
-			top: `${box.minY - pad}px`,
-			width: `${Math.max(0, box.maxX - box.minX + pad * 2)}px`,
-			height: `${Math.max(0, box.maxY - box.minY + pad * 2)}px`,
+	/* ==================== 悬浮切换器：拖动 / 收起 ==================== */
+
+	/**
+	 * 把胶囊放到设置里记住的位置。
+	 * y 存的是视口比例而不是像素：换设备、转屏后像素值会落到屏幕外，比例不会。
+	 */
+	private applySwitcherPos(): void {
+		const sw = this.toggleBtn;
+		if (!sw) return;
+		const side = this.plugin.settings.inkSwitcherSide ?? 'right';
+		const y = Math.min(1, Math.max(0, this.plugin.settings.inkSwitcherY ?? 0.78));
+		sw.setCssStyles({
+			left: side === 'left' ? '12px' : 'auto',
+			right: side === 'right' ? '12px' : 'auto',
+			top: `${Math.round(y * 100)}%`,
+			bottom: 'auto',
+			transform: 'translateY(-50%)',
 		});
 	}
 
 	/**
-	 * 页面滚动 / 窗口尺寸变化后重算边界框位置。
-	 * 不做这件事的话，滚动后框会停在原处与笔迹脱节 —— 比不画框更让人困惑。
+	 * 拖动换位 + 长按收起。
+	 * 位移小于 6px 一律当点击，超过才进入拖动；拖动结束后用一次捕获态 click 吞掉误点。
 	 */
-	private attachLassoBoxTracking(): void {
-		this.lassoBoxDetach?.();
-		const update = (): void => {
-			if (!this.lassoSelection.length) return;
-			const box = screenBBoxOfEditors(this.lassoSelection);
-			if (box) this.syncLassoBoxRect(box);
-		};
-		const host = this.scrollHost;
-		host?.addEventListener('scroll', update, { passive: true });
-		window.addEventListener('resize', update);
-		// pdf.js 缩放（捏合）后页面尺寸变化，ResizeObserver 比 resize 更可靠
-		let ro: ResizeObserver | null = null;
-		if (typeof ResizeObserver === 'function' && host) {
-			ro = new ResizeObserver(update);
-			ro.observe(host);
-		}
-		this.lassoBoxDetach = () => {
-			host?.removeEventListener('scroll', update);
-			window.removeEventListener('resize', update);
-			ro?.disconnect();
-		};
-	}
+	private attachSwitcherDrag(sw: HTMLElement): void {
+		let dragging = false;
+		let moved = false;
+		let startX = 0;
+		let startY = 0;
+		let originLeft = 0;
+		let originTop = 0;
+		let longPress: number | null = null;
 
-	private hideLassoBox(): void {
-		this.lassoBoxDetach?.();
-		this.lassoBoxDetach = null;
-		this.lassoBoxEl?.remove();
-		this.lassoBoxEl = null;
-	}
-
-	/* ---- 圈选虚线的实时预览（fixed 全屏 SVG，pointer-events:none）---- */
-
-	private ensureLassoOverlay(): void {
-		if (this.lassoOverlay?.isConnected) return;
-		const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-		svg.setAttribute('class', 'fleur-pdf-lasso-overlay');
-		const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-		svg.appendChild(path);
-		document.body.appendChild(svg);
-		this.lassoOverlay = svg;
-		this.lassoPathEl = path;
-	}
-
-	private drawLassoPath(): void {
-		this.ensureLassoOverlay();
-		if (!this.lassoPathEl || !this.lassoPts.length) return;
-		const d = this.lassoPts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ');
-		this.lassoPathEl.setAttribute('d', d);
-	}
-
-	private clearLassoPath(): void {
-		this.lassoPathEl?.setAttribute('d', '');
-		this.lassoOverlay?.remove();
-		this.lassoOverlay = null;
-		this.lassoPathEl = null;
-	}
-
-	/* ============================ 触摸层（R9 → 0.2.0 重构） ============================
-	 *
-	 * 两层配合，解决两件事：
-	 *
-	 * A. 手势盾（attachGestureShield）—— 0.1.0 真机反馈：书写时左右滑动会呼出
-	 *    Obsidian 的功能区 / 侧边栏。根因：Obsidian 的边缘滑手势监听 document 级
-	 *    touch 事件，而书写通道（pdf.js 的 pointer、橡皮/套索的自建 pointer）都
-	 *    拦不住 touch。盾在 **window 捕获阶段** 拦 touch：window 比 document 更靠
-	 *    传播路径上游，stopPropagation 后手势识别器再也收不到事件。
-	 *    pointer 事件由输入系统独立派发，不受影响 —— pdf.js 书写照常。
-	 *
-	 * B. 触摸路由（attachTouchRouter）—— GoodNotes 式防误触：手写模式下
-	 *    手指（pointerType=touch）滚动页面，笔（pointerType=pen）才落墨。
-	 *    手指的 pointerdown 在 host 捕获阶段被拦下（pdf.js 看不到，自然不画），
-	 *    然后自己驱动 scrollTop/scrollLeft。可在设置里关掉（关掉后恢复 0.1.0
-	 *    的「触摸绘制 + 双指滚动」语义）。
-	 */
-
-	/** 手势盾的卸载器。 */
-	private gestureShieldDetach: (() => void) | null = null;
-
-	/**
-	 * 目标是否落在 PDF 滚动区域内。
-	 * 笔盒与模式切换器挂在 document.body 下（不在 scrollHost 内），天然被排除 ——
-	 * 这是「只在 PDF 区域接管触摸」的唯一依据。
-	 */
-	private isInPdfArea(target: EventTarget | null): boolean {
-		const el = target as HTMLElement | null;
-		return !!el && !!this.scrollHost && (el === this.scrollHost || this.scrollHost.contains(el));
-	}
-
-	private attachGestureShield(): void {
-		if (this.gestureShieldDetach) return;
-
-		const onTouchStart = (e: TouchEvent): void => {
-			if (!this.active || !this.isInPdfArea(e.target)) return;
-			// 阻断 Obsidian 的边缘滑动 / 手势识别（document 级监听全部收不到）
-			e.stopPropagation();
-		};
-		const onTouchMove = (e: TouchEvent): void => {
-			if (!this.active || !this.isInPdfArea(e.target)) return;
-			e.stopPropagation();
-			// 阻掉 WebKit 原生滚动与回弹 —— 滚动由触摸路由自己驱动
-			e.preventDefault();
-		};
-		const onTouchEnd = (e: TouchEvent): void => {
-			if (!this.active || !this.isInPdfArea(e.target)) return;
-			e.stopPropagation();
+		const clearLongPress = () => {
+			if (longPress !== null) {
+				window.clearTimeout(longPress);
+				longPress = null;
+			}
 		};
 
-		window.addEventListener('touchstart', onTouchStart, { capture: true, passive: true });
-		window.addEventListener('touchmove', onTouchMove, { capture: true, passive: false });
-		window.addEventListener('touchend', onTouchEnd, { capture: true, passive: true });
-		window.addEventListener('touchcancel', onTouchEnd, { capture: true, passive: true });
-
-		this.gestureShieldDetach = () => {
-			window.removeEventListener('touchstart', onTouchStart, { capture: true });
-			window.removeEventListener('touchmove', onTouchMove, { capture: true });
-			window.removeEventListener('touchend', onTouchEnd, { capture: true });
-			window.removeEventListener('touchcancel', onTouchEnd, { capture: true });
-		};
-	}
-
-	private detachGestureShield(): void {
-		this.gestureShieldDetach?.();
-		this.gestureShieldDetach = null;
-	}
-
-	/* ---- 触摸路由 ---- */
-
-	private touchRouterDetach: (() => void) | null = null;
-	private readonly touchPointers = new Map<number, { x: number; y: number }>();
-	private touchScrolling = false;
-	private touchStartY = 0;
-	private touchStartX = 0;
-	private touchStartScrollTop = 0;
-	private touchStartScrollLeft = 0;
-
-	private touchCenterY(): number {
-		let sum = 0;
-		for (const p of this.touchPointers.values()) sum += p.y;
-		return this.touchPointers.size ? sum / this.touchPointers.size : 0;
-	}
-
-	private touchCenterX(): number {
-		let sum = 0;
-		for (const p of this.touchPointers.values()) sum += p.x;
-		return this.touchPointers.size ? sum / this.touchPointers.size : 0;
-	}
-
-	private beginTouchScroll(): void {
-		const host = this.scrollHost;
-		if (!host) return;
-		this.touchScrolling = true;
-		this.touchStartY = this.touchCenterY();
-		this.touchStartX = this.touchCenterX();
-		this.touchStartScrollTop = host.scrollTop;
-		this.touchStartScrollLeft = host.scrollLeft;
-	}
-
-	/** 剩余触点继续滚动时重设基准，避免跳动。 */
-	private rebaseTouchScroll(): void {
-		const host = this.scrollHost;
-		if (!host || !this.touchScrolling) return;
-		this.touchStartY = this.touchCenterY();
-		this.touchStartX = this.touchCenterX();
-		this.touchStartScrollTop = host.scrollTop;
-		this.touchStartScrollLeft = host.scrollLeft;
-	}
-
-	/** 让 pdf.js 放弃已经开始的那一笔（第二触点出现时调用）。 */
-	private cancelInkStroke(): void {
-		const host = this.scrollHost;
-		if (!host) return;
-		const layerDiv = host.querySelector('.annotationEditorLayer');
-		for (const id of this.touchPointers.keys()) {
+		sw.addEventListener('pointerdown', (e) => {
+			if (e.pointerType === 'mouse' && e.button !== 0) return;
+			dragging = true;
+			moved = false;
+			startX = e.clientX;
+			startY = e.clientY;
+			const r = sw.getBoundingClientRect();
+			originLeft = r.left;
+			originTop = r.top;
+			sw.setCssStyles({
+				left: `${originLeft}px`,
+				right: 'auto',
+				top: `${originTop}px`,
+				bottom: 'auto',
+				transform: 'none',
+			});
 			try {
-				layerDiv?.dispatchEvent(
-					new PointerEvent('pointercancel', { pointerId: id, bubbles: true, cancelable: true }),
-				);
+				(sw as HTMLElement).setPointerCapture(e.pointerId);
 			} catch {
-				/* 老 WebView 不支持 PointerEvent 构造时忽略 */
+				/* 某些 WebView 对已释放指针抛错，忽略 */
 			}
-		}
-	}
+			clearLongPress();
+			longPress = window.setTimeout(() => {
+				longPress = null;
+				if (moved) return;
+				dragging = false;
+				this.setSwitcherCollapsed(true);
+			}, 650);
+		}, true);
 
-	/**
-	 * 解析真正的滚动容器。
-	 *
-	 * 从 PDF 页面元素向上找第一个「overflow 可滚动」的祖先，优先返回内容确实溢出
-	 * （scrollHeight/clientHeight 不等）的那一个；找不到溢出的就退化为第一个可滚动的；
-	 * 都没有才回落到类名候选。这样不依赖 Obsidian 的 DOM 层级细节 ——
-	 * 那个层级在桌面 / 移动 / 不同版本之间并不一致。
-	 */
-	private resolveScrollHost(): HTMLElement | null {
-		const inner =
-			(document.querySelector('.pdfViewer .page') as HTMLElement | null) ??
-			this.engine.getPageElement(1);
-		let fallback: HTMLElement | null = null;
-		let el: HTMLElement | null = inner?.parentElement ?? null;
-		while (el && el !== document.body) {
-			const cs = getComputedStyle(el);
-			if (/(auto|scroll)/.test(`${ cs.overflowY } ${ cs.overflowX }`)) {
-				if (!fallback) fallback = el;
-				const overflows =
-					el.scrollHeight > el.clientHeight + 1 || el.scrollWidth > el.clientWidth + 1;
-				if (overflows) return el;
+		sw.addEventListener('pointermove', (e) => {
+			if (!dragging) return;
+			if (e.pointerType !== 'mouse') e.preventDefault();
+			const dx = e.clientX - startX;
+			const dy = e.clientY - startY;
+			if (!moved) {
+				if (Math.hypot(dx, dy) < 6) return;
+				moved = true;
+				clearLongPress();
+				sw.addClass('is-dragging');
 			}
-			el = el.parentElement;
-		}
-		return fallback ?? (document.querySelector(SCROLL_SELECTOR) as HTMLElement | null);
-	}
+			sw.setCssStyles({ left: `${originLeft + dx}px`, top: `${originTop + dy}px` });
+		});
 
-	private attachTouchRouter(): void {
-		if (this.touchRouterDetach) return;
-
-		this.scrollHost = this.resolveScrollHost();
-		if (!this.scrollHost) return;
-
-		/** 触点是否落在 PDF 区域内（笔盒 / 侧边栏等自绘 UI 不在此范围内）。 */
-		const inPdfArea = (target: EventTarget | null): boolean => {
-			const el = target as HTMLElement | null;
-			return !!el?.closest?.('.pdf-viewer-container, .pdfViewer, .pdf-container');
-		};
-
-		const onDown = (e: PointerEvent): void => {
-			if (e.pointerType !== 'touch') return;
-			if (!inPdfArea(e.target)) return;
-			// 视图可能被重建（切换文件 / 重新打开），宿主失连时重新探测
-			if (!this.scrollHost?.isConnected) {
-				this.scrollHost = this.resolveScrollHost();
-				if (!this.scrollHost) return;
+		const finish = (e: PointerEvent) => {
+			if (!dragging) return;
+			dragging = false;
+			try {
+				(sw as HTMLElement).releasePointerCapture?.(e.pointerId);
+			} catch {
+				/* 忽略 */
 			}
-			this.touchPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-
-			if (!this.fingerScroll) {
-				// 关闭手指滚动：维持 0.1.0 语义 —— 触摸绘制，双指接管滚动
-				if (this.touchPointers.size === 2) {
-					this.beginTouchScroll();
-					// 第一个触点可能已经落墨，让 pdf.js 放弃本笔
-					this.cancelInkStroke();
-					e.stopPropagation();
-					e.preventDefault();
-				}
+			clearLongPress();
+			if (!moved) {
+				sw.removeClass('is-dragging');
+				this.applySwitcherPos();
 				return;
 			}
+			sw.removeClass('is-dragging');
+			sw.addEventListener('click', (ev) => {
+				ev.stopPropagation();
+				ev.preventDefault();
+			}, { capture: true, once: true });
 
-			// 手指滚动（GoodNotes 式防误触）：手指不再落墨，改为驱动滚动。
-			// stopPropagation 让 pdf.js 的编辑层收不到这个 pointerdown —— 手指画不出笔迹。
-			if (this.touchPointers.size === 1) {
-				this.beginTouchScroll();
-			}
-			e.stopPropagation();
+			const r = sw.getBoundingClientRect();
+			const side: 'left' | 'right' = r.left + r.width / 2 < window.innerWidth / 2 ? 'left' : 'right';
+			const half = r.height / 2;
+			const centerY = Math.min(window.innerHeight - half - 8, Math.max(half + 8, r.top + r.height / 2));
+			this.plugin.settings.inkSwitcherSide = side;
+			this.plugin.settings.inkSwitcherY = centerY / window.innerHeight;
+			void this.plugin.saveSettings().catch(() => undefined);
+			this.applySwitcherPos();
+		};
+		sw.addEventListener('pointerup', (e) => finish(e as PointerEvent));
+		sw.addEventListener('pointercancel', (e) => finish(e as PointerEvent));
+
+		// 收起态下点一下把手即恢复
+		sw.addEventListener('click', (e) => {
+			if (this.plugin.settings.inkSwitcherCollapsed !== true) return;
 			e.preventDefault();
-		};
-
-		const onMove = (e: PointerEvent): void => {
-			if (!this.touchPointers.has(e.pointerId)) return;
-			this.touchPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-			if (!this.touchScrolling) return;
-			const host = this.scrollHost;
-			if (!host) return;
 			e.stopPropagation();
-			e.preventDefault();
-			host.scrollTop = this.touchStartScrollTop - (this.touchCenterY() - this.touchStartY);
-			host.scrollLeft = this.touchStartScrollLeft - (this.touchCenterX() - this.touchStartX);
-		};
-
-		const onUp = (e: PointerEvent): void => {
-			if (!this.touchPointers.has(e.pointerId)) return;
-			this.touchPointers.delete(e.pointerId);
-			if (this.touchPointers.size === 0) {
-				this.touchScrolling = false;
-			} else if (this.touchScrolling) {
-				this.rebaseTouchScroll();
-			}
-		};
-
-		// 全部挂在 window 捕获阶段：滚动宿主可能因视图重建而更换，
-		// 挂死在某个元素上会在更换后失效（手指划不动的隐性成因之一）。
-		window.addEventListener('pointerdown', onDown, { capture: true, passive: false });
-		window.addEventListener('pointermove', onMove, { capture: true, passive: false });
-		window.addEventListener('pointerup', onUp, { capture: true });
-		window.addEventListener('pointercancel', onUp, { capture: true });
-
-		this.touchRouterDetach = () => {
-			window.removeEventListener('pointerdown', onDown, { capture: true });
-			window.removeEventListener('pointermove', onMove, { capture: true });
-			window.removeEventListener('pointerup', onUp, { capture: true });
-			window.removeEventListener('pointercancel', onUp, { capture: true });
-			this.touchPointers.clear();
-			this.touchScrolling = false;
-			this.scrollHost = null;
-		};
+			this.setSwitcherCollapsed(false);
+		}, true);
 	}
 
-	private detachTouchRouter(): void {
-		this.touchRouterDetach?.();
-		this.touchRouterDetach = null;
+	/** 收起 / 展开悬浮胶囊，状态持久化。 */
+	private setSwitcherCollapsed(collapsed: boolean): void {
+		this.plugin.settings.inkSwitcherCollapsed = collapsed;
+		void this.plugin.saveSettings().catch(() => undefined);
+		this.toggleBtn?.toggleClass('is-collapsed', collapsed);
+		if (collapsed) {
+			new Notice('悬浮按钮已收起：点侧边的小把手即可恢复，也可用命令面板的「显示 / 隐藏手写批注悬浮按钮」');
+		}
 	}
 
-	/** 卸载橡皮 / 套索 / 落笔收尾的输入接管（退出手写模式时调用，避免监听器跨模式残留）。 */
-	private detachPenInput(): void {
-		this.eraserDetach?.();
-		this.eraserDetach = null;
-		this.lassoDetach?.();
-		this.lassoDetach = null;
-		this.detachDrawSettle();
+	/** 供命令面板调用：显示 / 收起悬浮胶囊（用户彻底找不到入口时的兜底）。 */
+	toggleSwitcher(): void {
+		const s = this.plugin.settings;
+
+		if (s.inkSwitcherHidden === true) {
+			s.inkSwitcherHidden = false;
+			s.inkSwitcherCollapsed = false;
+			void this.plugin.saveSettings().catch(() => undefined);
+			this.toggleBtn?.removeClass('is-collapsed');
+			this.syncSwitcherVisibility();
+			new Notice('已显示手写批注悬浮按钮');
+			return;
+		}
+		if (s.inkSwitcherCollapsed === true) {
+			this.setSwitcherCollapsed(false);
+			return;
+		}
+		// 手写模式中不留无按钮的死角：先退出手写，用户就不必自己找出口
+		if (this.active) {
+			new Notice('请先退出手写模式，再隐藏悬浮按钮');
+			return;
+		}
+		s.inkSwitcherHidden = true;
+		void this.plugin.saveSettings().catch(() => undefined);
+		this.syncSwitcherVisibility();
+		new Notice('已隐藏悬浮按钮：可用命令面板或设置里的「显示悬浮按钮」重新打开');
 	}
 }
